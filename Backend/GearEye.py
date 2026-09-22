@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from Backend.Services.Red import comprobar_dispositivo
 
 app = FastAPI(title="GearEye API")
 
@@ -25,3 +26,11 @@ def obtener_dispositivos():
             "estado": "activo"
         }
     ]
+
+@app.get("/api/comprobar/{ip}")
+def comprobar_ip(ip: str):
+    estado = comprobar_dispositivo(ip)
+    return{
+        "ip": ip,
+        "activo": estado
+    }
