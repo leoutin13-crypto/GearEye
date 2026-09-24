@@ -19,7 +19,10 @@ def descubrir_dispositivos():
         for i, activo in enumerate(resultados,start=1):
             if activo:
                 ip = ips[i - 1]
-                dispositivos.append(ip)
+                dispositivos.append({
+                    "ip": ip,
+                    "estado": "activo"
+                })
                 
 
     return dispositivos
