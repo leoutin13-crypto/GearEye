@@ -116,3 +116,4 @@ button,a,summary{ -webkit-tap-highlight-color:transparent }
 .navigation .nav-item{transition:background .2s ease,color .2s ease,border-color .2s ease,box-shadow .2s ease,transform .2s ease}
 .navigation .nav-item.active{background:linear-gradient(105deg,#7669e837,#7669e812);border-color:#958aff32;box-shadow:inset 3px 0 #a198ff,0 5px 18px #050a1426;color:#fff}
 .navigation .nav-item.active .nav-icon{color:#b2aaff;filter:drop-shadow(0 0 5px #9b91ff70)}
+.inventory-scope select{font-weight:600;color:#6156bd}

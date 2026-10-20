@@ -1,6 +1,25 @@
-# GearEye: modelo entidad–relación
+# GearEye · Modelo entidad–relación
 
-El esquema PostgreSQL contiene siete tablas. Los campos `is_demo` permiten identificar los datos académicos sintéticos, que no aparecen en el inventario real de la aplicación.
+> **Persistencia de red en PostgreSQL**
+> Estructura para inventario, escaneos, mediciones, eventos, confianza y diagnósticos.
+
+<p align="center">
+  <img src="Modelo_Entidad_Relacion.svg" alt="Diagrama entidad-relación de GearEye" width="100%" />
+</p>
+
+## Resumen del esquema
+
+| Elemento | Diseño |
+|:--|:--|
+| Tablas | **7** |
+| Vistas materializadas | **2** |
+| Relaciones principales | Red → dispositivos y escaneos → mediciones |
+| Datos de demostración | Separados mediante `is_demo` |
+| Retención operativa | Hasta **180 días** para mediciones y eventos |
+
+Los registros académicos sintéticos están separados del inventario real con el campo `is_demo`. Las direcciones de demostración pertenecen a rangos reservados y no representan equipos ni tráfico reales.
+
+## Cómo se relacionan los datos
 
 ```mermaid
 erDiagram
@@ -11,90 +30,81 @@ erDiagram
     DEVICES ||--o{ EVENTS : genera
     DEVICES ||--o{ TRUSTED_DEVICES : clasifica
     DEVICES ||--o{ DIAGNOSTICS : recibe
-
-    NETWORKS {
-        bigint id PK
-        text name
-        text cidr UK
-        text gateway
-        float created_at
-        boolean monitor_enabled
-        integer monitor_interval_minutes
-        float alert_latency_threshold_ms
-        boolean alert_new_devices
-        boolean alert_offline_devices
-        boolean is_demo
-    }
-    DEVICES {
-        bigint id PK
-        bigint network_id FK
-        text ip
-        text mac
-        text name
-        text manufacturer
-        text model
-        text device_type
-        text current_state
-        float first_seen
-        float last_seen
-        text owner
-        text notes
-        boolean is_demo
-    }
-    SCAN_RUNS {
-        text scan_id PK
-        bigint network_id FK
-        float captured_at
-        boolean is_complete
-        boolean is_demo
-    }
-    MEASUREMENTS {
-        bigint id PK
-        text scan_id FK
-        bigint device_id FK
-        text ip
-        float captured_at
-        float latency_ms
-        text state
-        boolean is_demo
-    }
-    EVENTS {
-        bigint id PK
-        bigint device_id FK
-        text ip
-        text event_type
-        text previous_state
-        text current_state
-        float occurred_at
-        float acknowledged_at
-        boolean is_demo
-    }
-    TRUSTED_DEVICES {
-        text ip PK
-        bigint device_id FK
-        text mac
-        text device_name
-        float trusted_at
-        boolean is_demo
-    }
-    DIAGNOSTICS {
-        bigint id PK
-        bigint device_id FK
-        text ip
-        text level
-        text message
-        text recommendation
-        float latency_ms
-        float created_at
-        boolean is_demo
-    }
 ```
+
+Una red agrupa los dispositivos descubiertos y las ejecuciones de escaneo. Cada ejecución produce mediciones. Los eventos registran cambios observados, la lista de confianza conserva las decisiones del operador y los diagnósticos almacenan resultados de análisis por equipo.
+
+## Tablas
+
+<details open>
+<summary><strong>01 · networks</strong> — redes y configuración de monitoreo</summary>
+
+Identifica cada subred mediante su CIDR y almacena puerta de enlace, estado del monitoreo, intervalo y umbrales de alerta.
+
+**Clave:** `id` · **Identificador único:** `cidr`
+</details>
+
+<details>
+<summary><strong>02 · devices</strong> — inventario persistente de equipos</summary>
+
+Conserva IP, MAC, nombre, fabricantes, modelo, tipo, estado y fechas de primera y última detección. Incluye los campos operativos `owner` y `notes`.
+
+**Claves:** `id` · `network_id` → `networks.id` · **Unicidad:** red + IP
+</details>
+
+<details>
+<summary><strong>03 · scan_runs</strong> — ejecuciones de escaneo</summary>
+
+Registra cuándo se realizó un escaneo, a qué red pertenece y si se completó. `scan_id` identifica cada ejecución.
+
+**Clave:** `scan_id` · `network_id` → `networks.id`
+</details>
+
+<details>
+<summary><strong>04 · measurements</strong> — observaciones por dispositivo y escaneo</summary>
+
+Guarda estado, latencia y atributos observados en cada escaneo; permite construir el historial de disponibilidad y rendimiento.
+
+**Claves:** `id` · `scan_id` → `scan_runs.scan_id` · `device_id` → `devices.id`
+</details>
+
+<details>
+<summary><strong>05 · events</strong> — cambios y alertas de red</summary>
+
+Almacena nuevas detecciones, cambios de estado, ausencias y latencias elevadas, con marcas de tiempo y reconocimiento del operador.
+
+**Clave:** `id` · `device_id` → `devices.id`
+</details>
+
+<details>
+<summary><strong>06 · trusted_devices</strong> — equipos aprobados por el operador</summary>
+
+Relaciona la IP y MAC reconocidas con el equipo correspondiente y la fecha en que se marcó como confiable.
+
+**Clave:** `ip` · `device_id` → `devices.id`
+</details>
+
+<details>
+<summary><strong>07 · diagnostics</strong> — resultados de diagnóstico</summary>
+
+Conserva nivel, mensaje, recomendación, latencia, observaciones y fecha del diagnóstico asociado a una IP.
+
+**Clave:** `id` · `device_id` → `devices.id`
+</details>
 
 ## Vistas materializadas
 
-- `mv_device_performance`: mediciones, cantidad de respuestas y latencias media, mínima y máxima por dirección IP.
-- `mv_network_daily_summary`: escaneos completos, equipos y latencia media por red y día.
+| Vista | Contenido | Actualización |
+|:--|:--|:--|
+| `mv_device_performance` | Cantidad de mediciones, respuestas y latencias media, mínima y máxima por IP. | Después de guardar un escaneo en PostgreSQL. |
+| `mv_network_daily_summary` | Escaneos completos, dispositivos y latencia media por red y día. | Después de guardar un escaneo en PostgreSQL. |
 
-GearEye las refresca después de guardar cada escaneo en PostgreSQL. PostgreSQL conserva el resultado materializado y lo vuelve a calcular con `REFRESH MATERIALIZED VIEW` cuando se solicita; la aplicación realiza esa actualización automáticamente al terminar cada escaneo.
+PostgreSQL almacena los resultados de las consultas y GearEye los renueva con `REFRESH MATERIALIZED VIEW` al guardar un escaneo.
 
-El archivo [`../Database/modelo_geareye_postgresql.sql`](../Database/modelo_geareye_postgresql.sql) contiene el esquema ejecutable. [`../Database/seed_demo_postgresql.sql`](../Database/seed_demo_postgresql.sql) genera 100 filas sintéticas por tabla, y [`../Database/verificar_requisitos.sql`](../Database/verificar_requisitos.sql) comprueba las cantidades y las vistas.
+## Archivos del modelo
+
+- [Esquema PostgreSQL](../Database/modelo_geareye_postgresql.sql) — crea las siete tablas y las vistas materializadas.
+- [Datos de demostración](../Database/seed_demo_postgresql.sql) — genera 100 filas sintéticas por tabla, identificadas con `is_demo = TRUE`.
+- [Verificación de requisitos](../Database/verificar_requisitos.sql) — consulta tablas, registros de demostración y vistas.
+
+> **Alcance de los datos:** el historial refleja lo que GearEye detectó durante sus escaneos. No representa una captura continua de todo el tráfico ni identifica a la persona que utilizó un dispositivo.

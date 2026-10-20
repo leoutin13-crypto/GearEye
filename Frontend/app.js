@@ -134,6 +134,8 @@ async function checkAuth() {
       state.performanceScans = 0;
       renderSummary();
       renderDevices();
+      state.knownDevices = [];
+      if (state.inventoryMode === "conocidos") renderDevices();
       renderPerformance();
       $("#auth-gate").hidden = true;
       $("#session-expired").hidden = false;
@@ -174,6 +176,7 @@ async function logout(reason = "manual") {
     state.performance = [];
     state.performanceScans = 0;
     renderSummary();
+    state.knownDevices = [];
     renderDevices();
     renderPerformance();
     if (reason === "manual") {
@@ -355,6 +358,7 @@ async function scanNetwork(background = false) {
     if (response.status === 401) { await checkAuth(); return; }
     if (!response.ok) throw new Error(payload.detail || `La API respondi\u00f3 ${response.status}`);
     state.devices = Array.isArray(payload.dispositivos) ? payload.dispositivos : [];
+    if (state.inventoryMode === "conocidos") renderDevices();
     state.gateway = payload.puerta_enlace || null;
     state.localIp = payload.ip_local || null;
     state.subnet = payload.subred || null;
@@ -364,6 +368,7 @@ async function scanNetwork(background = false) {
     renderDevices();
     renderTopology();
     await loadStorageStatus(background);
+    await loadKnownDevices(background);
     await loadEvents(background);
     await loadAlerts(background);
     await loadPerformance(background);
@@ -377,6 +382,19 @@ async function scanNetwork(background = false) {
     elements.scan.classList.remove("loading");
     elements.scan.disabled = false;
     $("#scan-button-label").textContent = "Escanear red";
+  }
+}
+
+async function loadKnownDevices(background = false) {
+  try {
+    const response = await fetch(`${API_BASE}/api/inventario`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 401) { await checkAuth(); return; }
+    if (!response.ok) throw new Error(payload.detail || `La API respondió ${response.status}`);
+    state.knownDevices = Array.isArray(payload.dispositivos) ? payload.dispositivos : [];
+    if (state.inventoryMode === "conocidos") renderDevices();
+  } catch (error) {
+    if (!background) showToast(error.message || "No se pudo cargar el historial del inventario.");
   }
 }
 
@@ -931,6 +949,11 @@ $("#alerts-reload").addEventListener("click", () => loadAlerts());
 $("#performance-reload").addEventListener("click", () => loadPerformance());
 $("#performance-period").addEventListener("change", () => loadPerformance());
 $("#performance-search").addEventListener("input", renderPerformance);
+$("#inventory-scope").addEventListener("change", (event) => {
+  state.inventoryMode = event.target.value;
+  if (state.inventoryMode === "conocidos" && !state.knownDevices.length) loadKnownDevices();
+  renderDevices();
+});
 window.addEventListener("resize", drawTopologyLinks);
 elements.search.addEventListener("input", renderDevices);
 elements.filter.addEventListener("change", renderDevices);
