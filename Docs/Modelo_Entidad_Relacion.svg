@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 760" role="img" aria-labelledby="title description">
+  <title id="title">Modelo entidad-relación de GearEye</title>
+  <desc id="description">Diagrama de siete tablas PostgreSQL relacionadas por claves foráneas.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#7467e8"/></marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#1c2940" flood-opacity=".10"/></filter>
+    <style>
+      text{font-family:Inter,"Segoe UI",sans-serif;fill:#26334a}.title{font-size:26px;font-weight:700;letter-spacing:-.5px}.subtitle{font-size:13px;fill:#7c879b}.entity{fill:#fff;stroke:#e4e9f1;stroke-width:1.4;filter:url(#shadow)}.head{fill:#151d32}.headtext{fill:#fff;font-size:14px;font-weight:700;letter-spacing:.7px}.field{font-size:12px}.key{font-size:10px;font-weight:700;fill:#7164e2}.muted{fill:#8490a3}.relation{fill:none;stroke:#8175e8;stroke-width:2;marker-end:url(#arrow)}.rel-label{font-size:10px;font-weight:600;fill:#7064d5;paint-order:stroke;stroke:#f6f8fc;stroke-width:5px;stroke-linejoin:round}.badge{fill:#f0eeff}.badgeText{font-size:9px;font-weight:700;fill:#665bd1}
+    </style>
+  </defs>
+  <rect width="1440" height="760" rx="18" fill="#f6f8fc"/>
+  <text class="title" x="42" y="43">GearEye · Modelo entidad–relación</text>
+  <text class="subtitle" x="42" y="66">Siete tablas PostgreSQL · Las relaciones se implementan con claves foráneas</text>
+
+  <!-- Relationships behind the entities -->
+  <path class="relation" d="M300 180H370"/><text class="rel-label" x="311" y="169">1:N</text>
+  <path class="relation" d="M170 310V535H370"/><text class="rel-label" x="178" y="424">1:N</text>
+  <path class="relation" d="M705 240H760V475H800"/><text class="rel-label" x="714" y="230">1:N</text>
+  <path class="relation" d="M705 127H800"/><text class="rel-label" x="735" y="116">1:N</text>
+  <path class="relation" d="M705 87V24H1270V50"/><text class="rel-label" x="920" y="18">1:N</text>
+  <path class="relation" d="M705 320H750V545H1180"/><text class="rel-label" x="714" y="310">1:N</text>
+  <path class="relation" d="M705 545H800"/><text class="rel-label" x="735" y="534">1:N</text>
+
+  <g transform="translate(40 105)">
+    <rect class="entity" width="260" height="230" rx="12"/><path class="head" d="M12 0H248a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">NETWORKS</text><rect class="badge" x="204" y="14" width="42" height="21" rx="10"/><text class="badgeText" x="214" y="28">PADRE</text>
+    <text class="key" x="18" y="76">PK</text><text class="field" x="54" y="76">id</text>
+    <text class="field" x="18" y="101">name</text><text class="field" x="18" y="126">cidr · UNIQUE</text><text class="field" x="18" y="151">gateway</text><text class="field" x="18" y="176">created_at · is_demo</text><text class="field" x="18" y="201">monitor_enabled · interval_minutes</text><text class="field" x="18" y="226">latency_threshold · alert options</text>
+  </g>
+  <g transform="translate(375 65)">
+    <rect class="entity" width="330" height="300" rx="12"/><path class="head" d="M12 0H318a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">DEVICES</text><rect class="badge" x="270" y="14" width="42" height="21" rx="10"/><text class="badgeText" x="280" y="28">HIJA</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">id</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">network_id → networks.id</text>
+    <text class="field" x="18" y="132">ip · mac · name</text><text class="field" x="18" y="157">manufacturer · model</text><text class="field" x="18" y="182">device_type · current_state</text><text class="field" x="18" y="207">first_seen · last_seen</text><text class="field" x="18" y="232">owner · notes</text><text class="field" x="18" y="257">UNIQUE(network_id, ip)</text><text class="field muted" x="18" y="283">is_demo separa ejemplos de equipos reales</text>
+  </g>
+  <g transform="translate(375 450)">
+    <rect class="entity" width="330" height="195" rx="12"/><path class="head" d="M12 0H318a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">SCAN_RUNS</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">scan_id</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">network_id → networks.id</text>
+    <text class="field" x="18" y="132">captured_at</text><text class="field" x="18" y="157">is_complete · is_demo</text>
+  </g>
+  <g transform="translate(800 385)">
+    <rect class="entity" width="390" height="280" rx="12"/><path class="head" d="M12 0H378a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">MEASUREMENTS</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">id</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">scan_id → scan_runs.scan_id</text><text class="key" x="18" y="127">FK</text><text class="field" x="54" y="127">device_id → devices.id</text>
+    <text class="field" x="18" y="157">ip · captured_at · latency_ms</text><text class="field" x="18" y="182">state · manufacturer · model</text><text class="field" x="18" y="207">device_type · mac · is_demo</text><text class="field muted" x="18" y="249">Historial de respuesta y disponibilidad</text>
+  </g>
+  <g transform="translate(800 75)">
+    <rect class="entity" width="270" height="220" rx="12"/><path class="head" d="M12 0H258a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">EVENTS</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">id</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">device_id → devices.id</text>
+    <text class="field" x="18" y="132">ip · event_type · occurred_at</text><text class="field" x="18" y="157">previous_state · current_state</text><text class="field" x="18" y="182">acknowledged_at · is_demo</text>
+  </g>
+  <g transform="translate(1150 75)">
+    <rect class="entity" width="250" height="205" rx="12"/><path class="head" d="M12 0H238a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">TRUSTED_DEVICES</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">ip</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">device_id → devices.id</text>
+    <text class="field" x="18" y="132">mac · device_name</text><text class="field" x="18" y="157">trusted_at · is_demo</text>
+  </g>
+  <g transform="translate(1180 435)">
+    <rect class="entity" width="220" height="220" rx="12"/><path class="head" d="M12 0H208a12 12 0 0 1 12 12v38H0V12A12 12 0 0 1 12 0"/>
+    <text class="headtext" x="18" y="31">DIAGNOSTICS</text>
+    <text class="key" x="18" y="77">PK</text><text class="field" x="54" y="77">id</text><text class="key" x="18" y="102">FK</text><text class="field" x="54" y="102">device_id</text>
+    <text class="field" x="18" y="132">ip · level · message</text><text class="field" x="18" y="157">recommendation · latency_ms</text><text class="field" x="18" y="182">created_at · is_demo</text>
+  </g>
+  <text class="subtitle" x="42" y="718">Vistas materializadas: mv_device_performance · mv_network_daily_summary</text>
+</svg>
