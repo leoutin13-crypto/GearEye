@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: geareye
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${GEAREYE_DB_ADMIN_PASSWORD:?Set GEAREYE_DB_ADMIN_PASSWORD in .env}
+      GEAREYE_DB_PASSWORD: ${GEAREYE_DB_PASSWORD:?Set GEAREYE_DB_PASSWORD in .env}
+    volumes:
+      - geareye_postgres:/var/lib/postgresql/data
+      - ./init-app-role.sql:/docker-entrypoint-initdb.d/10-geareye-app-role.sql:ro
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geareye_app -d geareye"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  geareye:
+    build:
+      context: ../..
+      dockerfile: deploy/proxmox/Dockerfile
+    restart: unless-stopped
+    environment:
+      GEAREYE_DATABASE_URL: postgresql://geareye_app:${GEAREYE_DB_PASSWORD}@db:5432/geareye
+      GEAREYE_DATA_DIR: /data
+      GEAREYE_AUTH_FILE: /data/auth_state.json
+      GEAREYE_PUBLIC_URL: ${GEAREYE_PUBLIC_URL:?Set GEAREYE_PUBLIC_URL in .env}
+      GEAREYE_SMTP_HOST: ${GEAREYE_SMTP_HOST:?Set GEAREYE_SMTP_HOST in .env}
+      GEAREYE_SMTP_PORT: ${GEAREYE_SMTP_PORT:-587}
+      GEAREYE_SMTP_USER: ${GEAREYE_SMTP_USER:?Set GEAREYE_SMTP_USER in .env}
+      GEAREYE_SMTP_PASSWORD: ${GEAREYE_SMTP_PASSWORD:?Set GEAREYE_SMTP_PASSWORD in .env}
+      GEAREYE_SMTP_FROM: ${GEAREYE_SMTP_FROM:?Set GEAREYE_SMTP_FROM in .env}
+      GEAREYE_SMTP_STARTTLS: ${GEAREYE_SMTP_STARTTLS:-true}
+    volumes:
+      - geareye_data:/data
+    networks:
+      - edge
+      - database
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/auth/status', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env}"]
+    networks:
+      - edge
+    depends_on:
+      geareye:
+        condition: service_healthy
+
+volumes:
+  geareye_postgres:
+  geareye_data:
+
+networks:
+  edge:
+  database:
+    internal: true

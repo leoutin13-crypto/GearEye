@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import logging
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -46,8 +46,10 @@ from Backend.Services.Historial import (
     obtener_eventos_exportables,
     obtener_metadatos_dispositivos,
     obtener_inventario_conocido,
+    obtener_red_reciente,
 )
 from Backend import Authentication as auth
+from Backend.Services.TenantContext import active_company_id
 
 app = FastAPI(
     title="GearEye API",
@@ -73,11 +75,25 @@ class NotasDispositivoRequest(BaseModel):
     notas: str = Field(default="", max_length=2000)
 
 
+class AgentScanRequest(BaseModel):
+    subred: IPv4Network
+    puerta_enlace: IPv4Address | None = None
+    dispositivos: list[Dispositivo] = Field(max_length=4096)
+
+
 def subred_operativa(configuracion):
     red = configuracion["red"]
     if red.num_addresses > 256:
         return str(IPv4Network(f"{configuracion['ip']}/24", strict=False))
     return str(red)
+
+
+def subred_sesion(usuario):
+    if usuario.get("company_id", "default") != "default":
+        red = obtener_red_reciente()
+        return red["cidr"] if red else None
+    configuracion = obtener_configuracion_red_local()
+    return subred_operativa(configuracion) if configuracion else None
 
 app.mount(
     "/app",
@@ -99,6 +115,24 @@ def estado_servicio(_user: str = Depends(auth.require_user)):
     except DATABASE_CONNECTION_ERRORS as error:
         logger.exception("No se pudo conectar con %s", backend_name())
         raise HTTPException(status_code=503, detail=f"No hay conexi?n con {backend_name()}.") from error
+
+
+@app.post("/agent/report")
+def recibir_escaneo_agente(payload: AgentScanRequest, x_geareye_agent_token: str | None = Header(default=None)):
+    company = auth.company_for_agent_token(x_geareye_agent_token)
+    if not company:
+        raise HTTPException(status_code=401, detail="Credencial de agente inválida.")
+    if any(IPv4Address(device.ip) not in payload.subred for device in payload.dispositivos):
+        raise HTTPException(status_code=422, detail="El escaneo incluye equipos fuera de la subred declarada.")
+    active_company_id.set(company["id"])
+    cidr = str(payload.subred)
+    try:
+        registrar_eventos_escaneo(payload.dispositivos, cidr)
+        guardar_escaneo(payload.dispositivos, cidr, str(payload.puerta_enlace) if payload.puerta_enlace else None)
+    except STORAGE_ERRORS as error:
+        logger.exception("El agente no pudo guardar el escaneo de %s", company["name"])
+        raise HTTPException(status_code=503, detail="No se pudo guardar el escaneo recibido.") from error
+    return {"ok": True, "empresa": company["name"], "dispositivos": len(payload.dispositivos)}
 
 
 @app.get("/auth/status")
@@ -134,6 +168,31 @@ def verificar_codigo(
     return auth.verify_login(payload, response, request)
 
 
+@app.get("/auth/admin/overview")
+def resumen_administracion(_user: dict = Depends(auth.require_user)):
+    return auth.admin_overview(_user)
+
+
+@app.post("/auth/admin/companies")
+def crear_empresa(payload: auth.CompanyRequest, _user: dict = Depends(auth.require_user)):
+    return auth.create_company(_user, payload)
+
+
+@app.post("/auth/admin/invitations")
+def invitar_usuario(payload: auth.InviteRequest, request: Request, _user: dict = Depends(auth.require_user)):
+    return auth.invite_user(_user, payload, request)
+
+
+@app.post("/auth/accept-invitation")
+def aceptar_invitacion(payload: auth.AcceptInviteRequest, request: Request):
+    return auth.accept_invite(payload, request)
+
+
+@app.post("/auth/confirm-invitation/{token}")
+def confirmar_invitacion(token: str, payload: auth.CodeRequest, response: Response, request: Request):
+    return auth.confirm_invite(token, payload, response, request)
+
+
 @app.post("/auth/logout")
 def cerrar_sesion(response: Response, request: Request):
     return auth.logout(response, request)
@@ -158,6 +217,15 @@ def inicio():
 def obtener_dispositivos(_user: str = Depends(auth.require_user)):
     try:
         verificar_base_datos()
+        if _user.get("company_id", "default") != "default":
+            historial = obtener_inventario_conocido()
+            dispositivos = [Dispositivo(**device) for device in historial["dispositivos"]]
+            red = obtener_red_reciente() or {}
+            return {
+                "total": len(dispositivos), "dispositivos": dispositivos,
+                "puerta_enlace": red.get("gateway"), "ip_local": None,
+                "subred": red.get("cidr"),
+            }
         escaneo = descubrir_red_local()
         dispositivos = aplicar_confianza(escaneo["dispositivos"])
         metadatos = obtener_metadatos_dispositivos([device.ip for device in dispositivos])
@@ -221,7 +289,7 @@ def alertas_red(
 
 
 @app.post("/api/alertas/{alert_id}/reconocer")
-def reconocer_alerta_red(alert_id: int, _user: str = Depends(auth.require_user)):
+def reconocer_alerta_red(alert_id: int, _user: str = Depends(auth.require_company_admin)):
     try:
         if not reconocer_alerta(alert_id):
             raise HTTPException(status_code=404, detail="La alerta ya fue reconocida o no existe.")
@@ -233,11 +301,11 @@ def reconocer_alerta_red(alert_id: int, _user: str = Depends(auth.require_user))
 
 @app.get("/api/configuracion/monitoreo")
 def leer_configuracion_operativa(_user: str = Depends(auth.require_user)):
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion:
-        raise HTTPException(status_code=503, detail="No se pudo identificar la subred local.")
+    cidr = subred_sesion(_user)
+    if not cidr:
+        raise HTTPException(status_code=503, detail="A?n no se recibi? un escaneo del agente de esta empresa.")
     try:
-        return obtener_configuracion_operativa(subred_operativa(configuracion))
+        return obtener_configuracion_operativa(cidr)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo consultar la configuraci\u00f3n operativa")
         raise HTTPException(status_code=503, detail="La configuraci\u00f3n no est\u00e1 disponible.") from error
@@ -246,13 +314,13 @@ def leer_configuracion_operativa(_user: str = Depends(auth.require_user)):
 @app.put("/api/configuracion/monitoreo")
 def guardar_configuracion_operativa_api(
     payload: ConfiguracionOperativa,
-    _user: str = Depends(auth.require_user),
+    _user: str = Depends(auth.require_company_admin),
 ):
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion:
-        raise HTTPException(status_code=503, detail="No se pudo identificar la subred local.")
+    cidr = subred_sesion(_user)
+    if not cidr:
+        raise HTTPException(status_code=503, detail="A?n no se recibi? un escaneo del agente de esta empresa.")
     try:
-        return guardar_configuracion_operativa(subred_operativa(configuracion), payload.model_dump())
+        return guardar_configuracion_operativa(cidr, payload.model_dump())
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo guardar la configuraci\u00f3n operativa")
         raise HTTPException(status_code=503, detail="No se pudo guardar la configuraci\u00f3n.") from error
@@ -264,8 +332,8 @@ def leer_notas_dispositivo(ip: str, _user: str = Depends(auth.require_user)):
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion or ip_validada not in configuracion["red"]:
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes consultar equipos de la subred local.")
     try:
         result = obtener_notas_dispositivo(str(ip_validada))
@@ -281,14 +349,14 @@ def leer_notas_dispositivo(ip: str, _user: str = Depends(auth.require_user)):
 def guardar_notas_dispositivo_api(
     ip: str,
     payload: NotasDispositivoRequest,
-    _user: str = Depends(auth.require_user),
+    _user: str = Depends(auth.require_company_admin),
 ):
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion or ip_validada not in configuracion["red"]:
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes modificar equipos de la subred local.")
     try:
         result = guardar_notas_dispositivo(
@@ -338,14 +406,14 @@ def exportar_eventos_csv(
 def confianza_dispositivo(
     ip: str,
     payload: ConfianzaRequest,
-    _user: str = Depends(auth.require_user),
+    _user: str = Depends(auth.require_company_admin),
 ):
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcciÃ³n debe ser una IPv4 vÃ¡lida.") from error
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion or ip_validada not in configuracion["red"]:
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes administrar equipos de la subred local.")
     try:
         identidad = obtener_identidad_escaneada(str(ip_validada))
@@ -444,10 +512,29 @@ def descargar_informe_csv(
 
 @app.get("/api/comprobar/{ip}", response_model=Dispositivo)
 def comprobar_ip(ip: str, _user: str = Depends(auth.require_user)):
-    return comprobar_dispositivo(ip)
+    if _user.get("company_id", "default") != "default":
+        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
+    try:
+        ip_validada = IPv4Address(ip)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
+        raise HTTPException(status_code=403, detail="Solo puedes comprobar equipos de tu subred.")
+    return comprobar_dispositivo(str(ip_validada))
 
 @app.get("/api/diagnostico/{ip}", response_model=ResultadoDiagnostico)
-def diagnostico_ip(ip: str, _user: str = Depends(auth.require_user)):
+def diagnostico_ip(ip: str, _user: str = Depends(auth.require_company_admin)):
+    if _user.get("company_id", "default") != "default":
+        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
+    try:
+        ip_validada = IPv4Address(ip)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
+        raise HTTPException(status_code=403, detail="Solo puedes diagnosticar equipos de tu subred.")
+    ip = str(ip_validada)
     dispositivo = comprobar_dispositivo(ip)
     diagnostico = analizar_dispositivo(dispositivo)
     try:
@@ -462,13 +549,15 @@ def diagnostico_ip(ip: str, _user: str = Depends(auth.require_user)):
 
 
 @app.post("/api/diagnostico-avanzado/{ip}")
-def diagnostico_avanzado_ip(ip: str, _user: str = Depends(auth.require_user)):
+def diagnostico_avanzado_ip(ip: str, _user: str = Depends(auth.require_company_admin)):
+    if _user.get("company_id", "default") != "default":
+        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
-    configuracion = obtener_configuracion_red_local()
-    if not configuracion or ip_validada not in configuracion["red"]:
+    cidr = subred_sesion(_user)
+    if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="El diagn\u00f3stico avanzado solo admite IP de la subred local.")
     return analizar_red_avanzado(str(ip_validada))
 

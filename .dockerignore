@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.env
+**/.env
+Backend/data/
+**/auth_state.*
+*.sqlite
+*.sqlite3
+*.db

@@ -1,5 +1,5 @@
 const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:8000" : window.location.origin;
-const state = { devices: [], knownDevices: [], inventoryMode: "actual", selectedIp: null, lastScan: null, gateway: null, localIp: null, subnet: null, performance: [], performanceScans: 0, alerts: [], alertTotal: 0 };
+const state = { devices: [], knownDevices: [], inventoryMode: "actual", selectedIp: null, lastScan: null, gateway: null, localIp: null, subnet: null, performance: [], performanceScans: 0, alerts: [], alertTotal: 0, profileRole: null };
 const IDLE_TIMEOUT = 5 * 60 * 1000;
 let idleTimer = null;
 let warningTimer = null;
@@ -20,6 +20,8 @@ const elements = {
 };
 
 const navigationLinks = [...document.querySelectorAll(".navigation .nav-item")];
+const sectionNavigationLinks = navigationLinks.filter((link) => link.hash && document.querySelector(link.hash));
+let performanceNavigationPending = false;
 function activateNavigationLink(link) {
   navigationLinks.forEach((item) => {
     const active = item === link;
@@ -28,9 +30,42 @@ function activateNavigationLink(link) {
     else item.removeAttribute("aria-current");
   });
 }
-navigationLinks.forEach((link) => link.addEventListener("click", () => activateNavigationLink(link)));
+navigationLinks.forEach((link) => link.addEventListener("click", (event) => {
+  if (!link.hash) return;
+  const section = document.querySelector(link.hash);
+  if (!section) return;
+  event.preventDefault();
+  const mainContent = $(".main-content");
+  performanceNavigationPending = link.hash === "#performance";
+  mainContent.classList.toggle("performance-scroll-space", link.hash === "#performance");
+  activateNavigationLink(link);
+  history.pushState(null, "", link.hash);
+  section.scrollIntoView({ behavior: "smooth", block: "start" });
+}));
 const initialNavigationLink = navigationLinks.find((link) => link.hash === window.location.hash);
 if (initialNavigationLink) activateNavigationLink(initialNavigationLink);
+
+let navigationFrame = null;
+function updateNavigationFromScroll() {
+  navigationFrame = null;
+  const marker = window.innerHeight * 0.32;
+  let current = sectionNavigationLinks[0];
+  for (const link of sectionNavigationLinks) {
+    const section = document.querySelector(link.hash);
+    if (section && section.getBoundingClientRect().top <= marker) current = link;
+  }
+  if (current) {
+    activateNavigationLink(current);
+    if (current.hash === "#performance") performanceNavigationPending = false;
+    else if (!performanceNavigationPending) $(".main-content").classList.remove("performance-scroll-space");
+  }
+}
+function scheduleNavigationUpdate() {
+  if (navigationFrame === null) navigationFrame = window.requestAnimationFrame(updateNavigationFromScroll);
+}
+window.addEventListener("scroll", scheduleNavigationUpdate, { passive: true });
+window.addEventListener("resize", scheduleNavigationUpdate);
+scheduleNavigationUpdate();
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -58,7 +93,7 @@ function renderAuthForm(mode, message = "") {
   if (mode === "setup") {
     title.textContent = "Configura tu acceso";
     description.textContent = "Crea la cuenta administradora local. La clave inicial aparece en la terminal de Uvicorn.";
-    stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="setup-key">Clave inicial de GearEye</label><input id="setup-key" name="setup_key" autocomplete="one-time-code" required placeholder="Pega la clave mostrada en la terminal" /></div><div class="auth-field"><label for="setup-username">Nombre de usuario</label><input id="setup-username" name="username" autocomplete="username" minlength="3" maxlength="64" required placeholder="Administrador" /></div><div class="auth-field"><label for="setup-password">Contraseña</label><input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" required placeholder="Mínimo 12 caracteres" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Continuar con autenticador <span>→</span></button></form>`;
+    stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="setup-key">Clave inicial de GearEye</label><input id="setup-key" name="setup_key" autocomplete="one-time-code" required placeholder="Pega la clave mostrada en la terminal" /></div><div class="auth-field"><label for="setup-username">Tu nombre</label><input id="setup-username" name="username" autocomplete="name" minlength="3" maxlength="64" required placeholder="Leonel Serrano" /></div><div class="auth-field"><label for="setup-email">Correo de administrador</label><input id="setup-email" name="email" type="email" autocomplete="email" maxlength="254" required placeholder="nombre@empresa.com" /></div><div class="auth-field"><label for="setup-company">Empresa</label><input id="setup-company" name="company" minlength="2" maxlength="120" required placeholder="Nombre de la empresa" /></div><div class="auth-field"><label for="setup-password">Contraseña</label><input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" required placeholder="Mínimo 12 caracteres" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Continuar con autenticador <span>→</span></button></form>`;
   } else if (mode === "enroll") {
     title.textContent = "Vincula tu autenticador";
     description.textContent = "En tu app autenticadora, agrega una cuenta manual con esta clave. Luego confirma el código de seis dígitos.";
@@ -70,10 +105,19 @@ function renderAuthForm(mode, message = "") {
     stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="login-code">Código de autenticación</label><input id="login-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,8}" maxlength="8" required placeholder="000 000" autofocus /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Verificar e iniciar sesión</button><div class="auth-inline"><span></span><button type="button" class="auth-secondary" id="back-to-login">Volver</button></div></form>`;
     $("#back-to-login").addEventListener("click", () => renderAuthForm("login"));
     $("#login-code").focus();
+  } else if (mode === "invite") {
+    title.textContent = "Activa tu cuenta";
+    description.textContent = "Define una contrase\u00f1a y configura tu autenticador para aceptar la invitaci\u00f3n.";
+    stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="invite-password">Contrase&ntilde;a nueva</label><input id="invite-password" name="password" type="password" autocomplete="new-password" minlength="12" required placeholder="M\u00ednimo 12 caracteres" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Continuar</button></form>`;
+  } else if (mode === "invite-confirm") {
+    title.textContent = "Vincula tu autenticador";
+    description.textContent = "Agrega esta clave en tu app autenticadora y confirma el c\u00f3digo temporal.";
+    stage.innerHTML = `<div class="auth-form"><div class="auth-hint"><strong>Clave de configuraci\u00f3n \u00b7 GearEye</strong><span class="auth-secret" id="invite-secret"></span></div><form class="auth-form" id="auth-form"><div class="auth-field"><label for="invite-code">C&oacute;digo de tu autenticador</label><input id="invite-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,8}" maxlength="8" required placeholder="000 000" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Activar cuenta</button></form></div>`;
+    $("#invite-secret").textContent = state.inviteSecret || "";
   } else {
-    title.textContent = "Inicia sesión";
+    title.textContent = "Inicia sesi\u00f3n";
     description.textContent = "Accede a tu consola de red con tu cuenta GearEye.";
-    stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="login-username">Nombre de usuario</label><input id="login-username" name="username" autocomplete="username" required placeholder="Tu usuario" /></div><div class="auth-field"><label for="login-password">Contraseña</label><input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="Tu contraseña" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Continuar <span>→</span></button></form>`;
+    stage.innerHTML = `<form class="auth-form" id="auth-form"><div class="auth-field"><label for="login-username">Usuario o correo</label><input id="login-username" name="username" autocomplete="username" required placeholder="Tu usuario o correo electr&oacute;nico" /></div><div class="auth-field"><label for="login-password">Contraseña</label><input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="Tu contraseña" /></div><div class="auth-error" id="auth-error">${esc(message)}</div><button class="button button-primary auth-submit">Continuar <span>→</span></button></form>`;
   }
   $("#auth-form").addEventListener("submit", (event) => submitAuth(event, mode));
 }
@@ -99,7 +143,17 @@ async function submitAuth(event, mode) {
   submit.disabled = true;
   submit.textContent = "Verificando…";
   try {
-    if (mode === "setup") {
+    if (mode === "invite") {
+      const result = await postAuth("accept-invitation", { token: state.inviteToken, password: data.password });
+      state.inviteSecret = result.secret;
+      renderAuthForm("invite-confirm");
+    } else if (mode === "invite-confirm") {
+      await postAuth(`confirm-invitation/${encodeURIComponent(state.inviteToken)}`, { code: data.code });
+      state.inviteToken = null;
+      state.inviteSecret = null;
+      history.replaceState(null, "", window.location.pathname);
+      await checkAuth();
+    } else if (mode === "setup") {
       const result = await postAuth("setup", data);
       state.enrollmentSecret = result.secret;
       renderAuthForm("enroll");
@@ -147,12 +201,32 @@ async function checkAuth() {
       $("#auth-gate").hidden = true;
       $("#top-avatar").textContent = String(result.username || "GE").slice(0, 2).toUpperCase();
       $("#profile-avatar").textContent = String(result.username || "GE").slice(0, 2).toUpperCase();
-      $(".profile-copy strong").textContent = result.username;
+      $(".profile-copy strong").textContent = result.name || result.username;
+      state.profileRole = result.role;
+      state.isRemoteCompany = result.company_id !== "default";
+      document.body.classList.toggle("role-viewer", result.role === "viewer");
+      document.body.classList.toggle("remote-tenant", state.isRemoteCompany);
+      if (state.isRemoteCompany) $("#scan-button-label").textContent = "Actualizar datos";
+      $(".profile-copy span").textContent = result.company || (result.role === "platform_admin" ? "Administraci\u00f3n general" : "Sesi\u00f3n protegida");
+      const greeting = $("#welcome-heading");
+      if (greeting) greeting.textContent = `Bienvenido, ${result.name || result.username}`;
+      const companyLabel = $("#company-label");
+      if (companyLabel) companyLabel.textContent = result.company || "MONITOREO LOCAL";
+      if (state.isRemoteCompany) $(".subtitle").textContent = `Datos reportados desde la red de ${result.company || "tu empresa"} por GearEye Agent.`;
+      const adminNav = $("#admin-nav");
+      if (adminNav) {
+        adminNav.hidden = !["platform_admin", "company_admin"].includes(result.role);
+        $("#admin-workspace-label").hidden = adminNav.hidden;
+      }
       $("#security-status-text").textContent = "2FA activa en esta cuenta";
       setConnection(true, "Sesión protegida");
       await loadOperationalSettings();
       await scanNetwork();
       if (monitorEnabled) scheduleMonitor();
+    } else if (new URLSearchParams(window.location.search).has("invite")) {
+      stopIdleSession();
+      state.inviteToken = new URLSearchParams(window.location.search).get("invite");
+      renderAuthForm("invite");
     } else if (result.configured) {
       stopIdleSession();
       renderAuthForm("login");
@@ -372,7 +446,7 @@ async function scanNetwork(background = false) {
     await loadEvents(background);
     await loadAlerts(background);
     await loadPerformance(background);
-    if (!background) showToast(`Escaneo completado: ${state.devices.length} dispositivos detectados.`);
+    if (!background) showToast(state.isRemoteCompany ? `Inventario actualizado: ${state.devices.length} dispositivos.` : `Escaneo completado: ${state.devices.length} dispositivos detectados.`);
   } catch (error) {
     setConnection(false, "API no disponible");
     showToast(error.message.includes("Failed to fetch") ? "No se pudo conectar. Abre GearEye desde http://127.0.0.1:8000/app." : error.message);
@@ -381,7 +455,7 @@ async function scanNetwork(background = false) {
     monitorBusy = false;
     elements.scan.classList.remove("loading");
     elements.scan.disabled = false;
-    $("#scan-button-label").textContent = "Escanear red";
+    $("#scan-button-label").textContent = state.isRemoteCompany ? "Actualizar datos" : "Escanear red";
   }
 }
 

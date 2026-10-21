@@ -116,4 +116,13 @@ button,a,summary{ -webkit-tap-highlight-color:transparent }
 .navigation .nav-item{transition:background .2s ease,color .2s ease,border-color .2s ease,box-shadow .2s ease,transform .2s ease}
 .navigation .nav-item.active{background:linear-gradient(105deg,#7669e837,#7669e812);border-color:#958aff32;box-shadow:inset 3px 0 #a198ff,0 5px 18px #050a1426;color:#fff}
 .navigation .nav-item.active .nav-icon{color:#b2aaff;filter:drop-shadow(0 0 5px #9b91ff70)}
+.admin-workspace-label{margin-top:24px;margin-bottom:8px;color:#8b82dc}
+.sidebar-bottom .security-card{margin:0 1px 12px}
+.main-content.performance-scroll-space::after{content:"";display:block;height:calc(100vh - 120px);pointer-events:none}
 .inventory-scope select{font-weight:600;color:#6156bd}
+.administration-panel{margin:18px 0;padding:20px}.admin-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:18px 0}.admin-form{display:grid;align-content:start;gap:12px;padding:16px;border:1px solid var(--line);border-radius:9px;background:#fbfcff}.admin-form h3,.admin-tables h3{font:700 12px Manrope,sans-serif;color:var(--ink);margin:0 0 3px}.admin-form label{display:grid;gap:6px;font-size:10px;color:#69758b}.admin-form input,.admin-form select{height:36px;border:1px solid #e3e8f1;border-radius:6px;padding:0 10px;background:white;color:var(--ink);font:11px "DM Sans",sans-serif}.admin-form input:focus,.admin-form select:focus{outline:2px solid #9388f155;border-color:#897ced}.admin-form .button{justify-self:start}.admin-tables{display:grid;gap:18px}.admin-tables h3{margin-bottom:9px}.admin-note{font-size:10px;color:#8791a5;margin:14px 0 0}.admin-form[hidden],#admin-nav[hidden],#administration[hidden]{display:none!important}@media(max-width:760px){.admin-grid{grid-template-columns:1fr}.administration-panel{padding:14px}}
+.agent-setup{display:grid;gap:10px;margin:12px 0 18px;padding:15px;border:1px solid #dcd8ff;background:#f7f6ff;border-radius:9px}.agent-setup strong{font:700 12px Manrope,sans-serif;color:#342b75}.agent-setup p{font-size:10px;color:#69758b;line-height:1.6;margin:5px 0}.agent-setup pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:11px;border-radius:6px;background:#141b2a;color:#e4e8f3;font:10px/1.6 Consolas,monospace}.agent-setup[hidden]{display:none!important}
+.role-viewer .monitor-controls,.role-viewer #scan-button,.role-viewer .alert-ack,.role-viewer .asset-notes,.role-viewer .trust-control,.role-viewer #advanced-run{display:none!important}.remote-tenant .monitor-controls,.remote-tenant .diagnostic-box,.remote-tenant .advanced-panel,.remote-tenant #detail-refresh{display:none!important}
+.remote-tenant.role-viewer #scan-button{display:inline-flex!important}
+
+

@@ -13,7 +13,7 @@ class Dispositivo(BaseModel):
     modelo: Optional[str] = None
     tipo: str = "desconocido"
     estado: str
-    tiempo_respuesta: float = Field(ge=0)
+    tiempo_respuesta: Optional[float] = Field(default=None, ge=0)
     confianza: str = "por_revisar"
     responsable: Optional[str] = None
     notas: Optional[str] = None

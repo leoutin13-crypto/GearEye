@@ -1,6 +1,7 @@
 ﻿"""SQLite persistence for measured device response times."""
 
 import os
+import hashlib
 import sqlite3
 import threading
 import time
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from Backend.Services.Database import DATABASE_URL, connect_postgresql
+from Backend.Services.TenantContext import active_company_id
 
 
 DATA_DIR = Path(
@@ -20,20 +22,24 @@ DATA_DIR = Path(
 DATABASE = DATA_DIR / "history.sqlite3"
 RETENTION_DAYS = 180
 _POSTGRES_SCHEMA_LOCK = threading.Lock()
-_POSTGRES_SCHEMA_READY = False
+_POSTGRES_SCHEMAS_READY = set()
 
 
 def _connect():
-    global _POSTGRES_SCHEMA_READY
     if DATABASE_URL:
         connection = connect_postgresql()
         try:
-            if not _POSTGRES_SCHEMA_READY:
+            company_id = active_company_id.get() or "default"
+            schema = "public" if company_id == "default" else "geareye_" + hashlib.sha256(company_id.encode()).hexdigest()[:24]
+            if schema != "public":
+                connection.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            connection.execute(f'SET search_path TO "{schema}"')
+            if schema not in _POSTGRES_SCHEMAS_READY:
                 with _POSTGRES_SCHEMA_LOCK:
-                    if not _POSTGRES_SCHEMA_READY:
+                    if schema not in _POSTGRES_SCHEMAS_READY:
                         _ensure_postgresql_schema(connection)
                         connection.commit()
-                        _POSTGRES_SCHEMA_READY = True
+                        _POSTGRES_SCHEMAS_READY.add(schema)
             return connection
         except Exception:
             connection.close()
@@ -125,7 +131,9 @@ def _ensure_postgresql_schema(connection):
     )
     connection.execute(
         """DO $$ BEGIN
-             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_measurements_scan_runs') THEN
+             IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                            WHERE conname = 'fk_measurements_scan_runs'
+                              AND connamespace = current_schema()::regnamespace) THEN
                ALTER TABLE measurements ADD CONSTRAINT fk_measurements_scan_runs
                FOREIGN KEY (scan_id) REFERENCES scan_runs(scan_id);
              END IF;
@@ -234,7 +242,9 @@ def _ensure_postgresql_schema(connection):
 
 def _connect_sqlite():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE, timeout=15)
+    company_id = active_company_id.get() or "default"
+    path = DATABASE if company_id == "default" else DATA_DIR / f"history-{hashlib.sha256(company_id.encode()).hexdigest()[:24]}.sqlite3"
+    connection = sqlite3.connect(path, timeout=15)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 15000")
     connection.execute("PRAGMA foreign_keys = ON")
@@ -574,6 +584,17 @@ def verificar_base_datos():
     try:
         connection.execute("SELECT 1 AS conectado").fetchone()
         return True
+    finally:
+        connection.close()
+
+
+def obtener_red_reciente():
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT cidr, gateway FROM networks WHERE is_demo = FALSE ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         connection.close()
 
