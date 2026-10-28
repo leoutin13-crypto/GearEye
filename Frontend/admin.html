@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b1220" />
-    <title>Administración · GearEye</title>
+    <title>GearEye · Administración</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -12,26 +12,90 @@
     <link rel="stylesheet" href="admin.css" />
   </head>
   <body class="admin-page">
-    <div class="admin-shell">
-      <header class="admin-topbar">
-        <a class="brand" href="/app/" aria-label="GearEye inicio"><span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 16h5l3.2-8 6.1 16 3.1-8H28"/><circle cx="16" cy="16" r="13"/></svg></span><span class="brand-name">Gear<span>Eye</span><small>NETWORK INTELLIGENCE</small></span></a>
-        <div class="admin-top-actions"><span class="admin-identity"><strong id="admin-name">Cargando sesión</strong><small id="admin-company"></small></span><a class="button button-secondary" id="return-network" href="/app/">Volver a la red</a><button class="logout-button" id="admin-logout" type="button">Cerrar sesión</button></div>
-      </header>
-      <main class="admin-main">
-        <section class="admin-heading"><div><span class="eyebrow"><span class="eyebrow-dot"></span>ENTORNO ADMINISTRATIVO</span><h1>Administración</h1><p>Consulta usuarios, empresas y roles; crea empresas e invita personas a GearEye.</p></div><button class="button button-secondary" id="admin-refresh" type="button">Actualizar datos</button></section>
-        <div class="admin-denied" id="admin-denied" hidden>Esta pantalla es para administradores. <a href="/app/">Volver a GearEye</a></div>
-        <div id="admin-content" hidden>
-          <section class="admin-create-grid">
-            <form class="admin-card admin-form" id="company-form"><div><span class="admin-card-kicker">NUEVA ORGANIZACIÓN</span><h2>Crear empresa</h2><p>El administrador recibirá por correo su invitación y la configuración del agente.</p></div><label>Nombre de la empresa<input name="name" required minlength="2" maxlength="120" placeholder="Ej. Empresa ABC" /></label><label>Nombre del administrador<input name="admin_name" required minlength="2" maxlength="120" placeholder="Nombre y apellido" /></label><label>Correo del administrador<input name="admin_email" type="email" required maxlength="254" placeholder="persona@cualquier-dominio.com" /></label><button class="button button-primary" type="submit">Crear y enviar bienvenida</button></form>
-            <form class="admin-card admin-form" id="invite-form"><div><span class="admin-card-kicker">GESTIÓN DE CUENTAS</span><h2>Invitar usuario</h2><p>La persona recibirá un enlace para establecer su contraseña y autenticador.</p></div><label>Nombre<input name="name" required minlength="2" maxlength="120" placeholder="Nombre y apellido" /></label><label>Correo electrónico<input name="email" type="email" required maxlength="254" placeholder="persona@cualquier-dominio.com" /></label><label>Empresa<select name="company_id" id="invite-company" required></select></label><label>Rol<select name="role"><option value="viewer">Solo consulta</option><option value="company_admin">Administrador de empresa</option></select></label><button class="button button-primary" type="submit">Enviar invitación</button></form>
-          </section>
-          <section class="admin-card admin-company-card" id="companies-section"><div class="admin-section-heading"><div><span class="admin-card-kicker">ORGANIZACIONES</span><h2>Empresas asociadas</h2></div><span class="admin-total" id="company-total">0 empresas</span></div><div class="table-scroll"><table><thead><tr><th>EMPRESA</th><th>USUARIOS</th><th>ESTADO DEL AGENTE</th></tr></thead><tbody id="admin-companies"><tr><td colspan="3">Cargando...</td></tr></tbody></table></div></section>
-          <section class="admin-card admin-users-card"><div class="admin-section-heading"><div><span class="admin-card-kicker">CUENTAS Y PERMISOS</span><h2>Usuarios</h2><p>Consulta a qué empresa pertenece cada persona y el rol que tiene allí.</p></div><span class="admin-total" id="user-total">0 usuarios</span></div><div class="admin-user-filters"><label class="search-box"><span>⌕</span><input id="user-search" type="search" placeholder="Buscar por nombre o correo" aria-label="Buscar usuarios" /></label><label class="admin-filter-label">Empresa<select id="user-company-filter"><option value="">Todas las empresas</option></select></label><label class="admin-filter-label">Rol<select id="user-role-filter"><option value="">Todos los roles</option><option value="platform_admin">Administrador general</option><option value="company_admin">Administrador de empresa</option><option value="viewer">Solo consulta</option></select></label></div><div class="table-scroll"><table><thead><tr><th>NOMBRE</th><th>CORREO</th><th>EMPRESA</th><th>ROL EN LA EMPRESA</th><th>ESTADO</th></tr></thead><tbody id="admin-users"><tr><td colspan="5">Cargando...</td></tr></tbody></table></div><p class="admin-note">Las invitaciones vencen en 48 horas. Cada persona define su contraseña y activa su propio autenticador.</p></section>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/app/" aria-label="GearEye inicio">
+          <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 16h5l3.2-8 6.1 16 3.1-8H28"/><circle cx="16" cy="16" r="13"/></svg></span>
+          <span class="brand-name">Gear<span>Eye</span><small>NETWORK INTELLIGENCE</small></span>
+        </a>
+        <div class="workspace-label">ENTORNO DE RED</div>
+        <nav class="navigation" aria-label="Navegación principal">
+          <a class="nav-item" href="/app/#overview"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>Red local</a>
+          <a class="nav-item" href="/app/#topology"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="19" r="2.5"/><circle cx="19" cy="19" r="2.5"/><path d="m11 7-5 9m7-9 5 9M8 19h8"/></svg></span>Topología</a>
+          <a class="nav-item" href="/app/inventario.html"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span>Inventario</a>
+          <a class="nav-item" href="/app/#alerts"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9m-8 12h4"/></svg></span>Alertas</a>
+          <a class="nav-item" href="/app/#ai-analysis"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3m0 12v3M3 12h3m12 0h3"/><circle cx="12" cy="12" r="5"/></svg></span>Diagnóstico IA</a>
+          <a class="nav-item" href="/app/#performance"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17h4l3-9 4 12 3-8h4"/></svg></span>Rendimiento</a>
+          <div class="workspace-label admin-workspace-label">ENTORNO ADMINISTRATIVO</div>
+          <a class="nav-item active" href="/app/admin.html" aria-current="page"><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 7M21 20c0-2.8-1.7-5-4-5.7"/></svg></span>Administración<span class="nav-count" id="nav-pending" hidden></span></a>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="profile"><div class="avatar" id="profile-avatar">GE</div><div class="profile-copy"><strong id="profile-name">Cargando</strong><span id="profile-company">Sesión protegida</span></div><span class="profile-status" title="Cuenta activa" aria-label="Cuenta activa"></span></div>
         </div>
-        <footer class="admin-footer">GearEye · Administración de accesos</footer>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar"><div class="breadcrumbs">GearEye <span>/</span> <strong>Administración</strong></div><div class="topbar-actions"><a class="logout-button" href="/app/">Volver al panel</a><button class="logout-button" id="admin-logout" type="button">Cerrar sesión</button></div></header>
+
+        <section class="page-heading">
+          <div><h1>Administración</h1><p class="subtitle" id="admin-subtitle">Personas con acceso a GearEye, su empresa y lo que pueden hacer.</p></div>
+          <div class="heading-actions" id="admin-actions" hidden>
+            <button class="button button-secondary" id="admin-refresh" type="button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg><span>Actualizar</span></button>
+            <button class="button button-secondary" id="open-company" type="button" aria-expanded="false" aria-controls="company-form" hidden><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 21V5l8-2v18M12 8h8v13M8 9h.01M8 13h.01M8 17h.01M16 12h.01M16 16h.01M2 21h20"/></svg><span>Nueva empresa</span></button>
+            <button class="button button-primary" id="open-invite" type="button" aria-expanded="false" aria-controls="invite-form"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="8" r="3.5"/><path d="M4 20c0-3.3 2.7-6 6-6 1.4 0 2.6.4 3.6 1.2M18 14v6m-3-3h6"/></svg><span>Invitar persona</span></button>
+          </div>
+        </section>
+
+        <section class="panel admin-denied" id="admin-denied" hidden>
+          <div class="empty-state"><strong>Esta sección es para administradores</strong><span>Tu cuenta puede consultar la red, pero no gestionar personas. <a href="/app/">Volver al panel</a></span></div>
+        </section>
+
+        <div id="admin-content" hidden>
+          <form class="panel admin-composer" id="invite-form" hidden>
+            <div class="admin-composer-head"><div><h2>Invitar persona</h2><p>Recibirá un correo para crear su contraseña y activar su autenticador. El enlace vence en 48 horas.</p></div><button class="icon-button" type="button" data-close-composer aria-label="Cerrar formulario">×</button></div>
+            <div class="admin-fields">
+              <label>Nombre<input name="name" required minlength="2" maxlength="120" autocomplete="off" placeholder="Nombre y apellido" /></label>
+              <label>Correo electrónico<input name="email" type="email" required maxlength="254" autocomplete="off" placeholder="persona@empresa.com" /></label>
+              <label id="invite-company-field">Empresa<select name="company_id" id="invite-company" required></select></label>
+              <label>Rol<select name="role"><option value="viewer">Solo consulta</option><option value="company_admin">Administrador de empresa</option></select></label>
+            </div>
+            <p class="admin-role-help"><strong>Solo consulta</strong> ve la red, el inventario y las alertas. <strong>Administrador de empresa</strong> además invita personas y cambia la configuración de su empresa.</p>
+            <div class="admin-composer-actions"><button class="button button-secondary" type="button" data-close-composer>Cancelar</button><button class="button button-primary" type="submit">Enviar invitación</button></div>
+          </form>
+
+          <form class="panel admin-composer" id="company-form" hidden>
+            <div class="admin-composer-head"><div><h2>Nueva empresa</h2><p>Su administrador recibirá la invitación y las instrucciones para instalar el agente de red en la sede.</p></div><button class="icon-button" type="button" data-close-composer aria-label="Cerrar formulario">×</button></div>
+            <div class="admin-fields">
+              <label>Nombre de la empresa<input name="name" required minlength="2" maxlength="120" autocomplete="off" placeholder="Ej. Ferretería El Tornillo" /></label>
+              <label>Administrador<input name="admin_name" required minlength="2" maxlength="120" autocomplete="off" placeholder="Nombre y apellido" /></label>
+              <label>Correo del administrador<input name="admin_email" type="email" required maxlength="254" autocomplete="off" placeholder="persona@empresa.com" /></label>
+            </div>
+            <div class="admin-composer-actions"><button class="button button-secondary" type="button" data-close-composer>Cancelar</button><button class="button button-primary" type="submit">Crear y enviar bienvenida</button></div>
+          </form>
+
+          <section class="panel admin-overview" aria-label="Resumen de accesos"><dl class="inventory-facts" id="admin-facts"></dl></section>
+
+          <section class="panel admin-companies" id="companies-section" hidden>
+            <div class="panel-heading"><div><h2>Empresas</h2><p>Cada empresa ve solo su propia red. El agente instalado en la sede es el que envía los escaneos.</p></div><span class="admin-count" id="company-total">—</span></div>
+            <div class="table-scroll"><table class="admin-table"><thead><tr><th scope="col">EMPRESA</th><th scope="col">PERSONAS</th><th scope="col">INVITACIONES</th><th scope="col">AGENTE DE RED</th></tr></thead><tbody id="admin-companies"></tbody></table></div>
+          </section>
+
+          <section class="panel admin-people">
+            <div class="panel-heading"><div><h2>Personas</h2><p id="people-help">Cambia el rol o desactiva una cuenta desde su fila. Las personas desactivadas pierden el acceso de inmediato.</p></div><span class="admin-count" id="user-total">—</span></div>
+            <div class="table-toolbar admin-toolbar">
+              <label class="search-box"><span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg></span><input id="user-search" type="search" placeholder="Buscar por nombre o correo" aria-label="Buscar personas" /></label>
+              <div class="filter-wrap" id="company-filter-wrap"><label class="filter-label" for="user-company-filter">Empresa</label><select id="user-company-filter"><option value="">Todas</option></select></div>
+              <div class="filter-wrap"><label class="filter-label" for="user-role-filter">Rol</label><select id="user-role-filter"><option value="">Todos</option><option value="platform_admin">Administrador general</option><option value="company_admin">Administrador de empresa</option><option value="viewer">Solo consulta</option></select></div>
+              <div class="filter-wrap"><label class="filter-label" for="user-status-filter">Estado</label><select id="user-status-filter"><option value="">Todos</option><option value="active">Activas</option><option value="pending">Invitaciones</option><option value="disabled">Desactivadas</option></select></div>
+            </div>
+            <div class="table-scroll"><table class="admin-table admin-people-table"><thead><tr><th scope="col">PERSONA</th><th scope="col" class="col-company">EMPRESA</th><th scope="col">ROL</th><th scope="col">ESTADO</th><th scope="col"><span class="sr-only">Acciones</span></th></tr></thead><tbody id="admin-users"><tr><td colspan="5"><div class="empty-state"><span class="loader"></span><strong>Cargando personas</strong><span>Consultando las cuentas de GearEye.</span></div></td></tr></tbody></table></div>
+          </section>
+        </div>
+        <footer class="footer"><span>GearEye <b>·</b> Administración de accesos</span><span>Cada persona entra con su contraseña y el código de su autenticador.</span></footer>
       </main>
     </div>
     <div class="toast" id="toast" role="status"></div>
+    <script src="comun.js"></script>
     <script src="admin.js"></script>
   </body>
 </html>

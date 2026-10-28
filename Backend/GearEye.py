@@ -17,8 +17,10 @@ from Backend.Services.Red import (
     descubrir_red_local,
     obtener_configuracion_red_local,
 )
+from Backend.Services.Topologia import discover_lldp_topology
 
 from Backend.Services.Diagnostico import analizar_dispositivo, analizar_red_avanzado
+from Backend.Services.AnalisisIA import analizar_red
 from Backend.Services.Database import (
     DATABASE_CONFIGURATION_ERRORS,
     DATABASE_CONNECTION_ERRORS,
@@ -29,6 +31,7 @@ from Backend.Services.Database import (
 from Backend.Services.Historial import (
     guardar_escaneo,
     obtener_historial,
+    obtener_historial_equipo,
     obtener_eventos,
     obtener_datos_informe,
     registrar_eventos_escaneo,
@@ -47,6 +50,13 @@ from Backend.Services.Historial import (
     obtener_metadatos_dispositivos,
     obtener_inventario_conocido,
     obtener_red_reciente,
+    guardar_topologia,
+    obtener_topologia,
+    obtener_datos_analisis,
+    identificar_red,
+    listar_redes,
+    obtener_red,
+    renombrar_red,
 )
 from Backend import Authentication as auth
 from Backend.Services.TenantContext import active_company_id
@@ -75,10 +85,15 @@ class NotasDispositivoRequest(BaseModel):
     notas: str = Field(default="", max_length=2000)
 
 
+class RedRequest(BaseModel):
+    nombre: str = Field(default="", max_length=60)
+
+
 class AgentScanRequest(BaseModel):
     subred: IPv4Network
     puerta_enlace: IPv4Address | None = None
     dispositivos: list[Dispositivo] = Field(max_length=4096)
+    topologia: dict | None = None
 
 
 def subred_operativa(configuracion):
@@ -88,12 +103,44 @@ def subred_operativa(configuracion):
     return str(red)
 
 
-def subred_sesion(usuario):
+def subred_sesion(usuario, red_id=None):
+    if red_id is not None:
+        red = obtener_red(red_id)
+        return red["subred"] if red else None
     if usuario.get("company_id", "default") != "default":
         red = obtener_red_reciente()
-        return red["cidr"] if red else None
+        return red["subred"] if red else None
     configuracion = obtener_configuracion_red_local()
     return subred_operativa(configuracion) if configuracion else None
+
+
+def red_solicitada(red_id=None):
+    """Return the saved network being viewed: the one chosen in the panel or the latest scanned."""
+    if red_id is None:
+        return obtener_red_reciente()
+    red = obtener_red(red_id)
+    if red is None:
+        raise HTTPException(status_code=404, detail="La red seleccionada ya no está guardada.")
+    return red
+
+
+def id_red(red_id=None):
+    red = red_solicitada(red_id)
+    return red["id"] if red else None
+
+
+def respuesta_guardada(red, red_actual=None):
+    """Devices from the latest scans of a saved network, for a network this server is not on."""
+    historial = obtener_inventario_conocido(red["id"]) if red else {"dispositivos": []}
+    dispositivos = [Dispositivo(**device) for device in historial["dispositivos"]]
+    return {
+        "total": len(dispositivos), "dispositivos": dispositivos,
+        "puerta_enlace": red["gateway"] if red else None, "ip_local": None,
+        "subred": red["subred"] if red else None,
+        "topologia": (obtener_topologia(red["clave"]) if red else None)
+        or {"enabled": False, "reason": "not_reported", "links": []},
+        "red": red, "red_actual": red_actual, "en_vivo": False,
+    }
 
 app.mount(
     "/app",
@@ -114,7 +161,7 @@ def estado_servicio(_user: str = Depends(auth.require_user)):
         return {"api": "operativa", "base_datos": backend_name(), "conectada": True}
     except DATABASE_CONNECTION_ERRORS as error:
         logger.exception("No se pudo conectar con %s", backend_name())
-        raise HTTPException(status_code=503, detail=f"No hay conexi?n con {backend_name()}.") from error
+        raise HTTPException(status_code=503, detail=f"No hay conexión con {backend_name()}.") from error
 
 
 @app.post("/agent/report")
@@ -126,13 +173,33 @@ def recibir_escaneo_agente(payload: AgentScanRequest, x_geareye_agent_token: str
         raise HTTPException(status_code=422, detail="El escaneo incluye equipos fuera de la subred declarada.")
     active_company_id.set(company["id"])
     cidr = str(payload.subred)
+    gateway = str(payload.puerta_enlace) if payload.puerta_enlace else None
     try:
-        registrar_eventos_escaneo(payload.dispositivos, cidr)
-        guardar_escaneo(payload.dispositivos, cidr, str(payload.puerta_enlace) if payload.puerta_enlace else None)
+        red = identificar_red(cidr, gateway, payload.dispositivos)
+        registrar_eventos_escaneo(payload.dispositivos, network_id=red["id"])
+        guardar_escaneo(payload.dispositivos, network_id=red["id"])
+        guardar_topologia(red["clave"], payload.topologia or {"enabled": False, "reason": "not_reported", "links": []})
     except STORAGE_ERRORS as error:
         logger.exception("El agente no pudo guardar el escaneo de %s", company["name"])
         raise HTTPException(status_code=503, detail="No se pudo guardar el escaneo recibido.") from error
-    return {"ok": True, "empresa": company["name"], "dispositivos": len(payload.dispositivos)}
+    return {"ok": True, "empresa": company["name"], "red": red["nombre"], "dispositivos": len(payload.dispositivos)}
+
+
+@app.get("/agent/config")
+def configuracion_agente(x_geareye_agent_token: str | None = Header(default=None)):
+    """Let the LAN agent follow its company's saved monitoring interval and pause state."""
+    company = auth.company_for_agent_token(x_geareye_agent_token, mark_report=False)
+    if not company:
+        raise HTTPException(status_code=401, detail="Credencial de agente inválida.")
+    active_company_id.set(company["id"])
+    try:
+        network = obtener_red_reciente()
+        if not network:
+            return {"monitoreo_activo": False, "intervalo_minutos": 5}
+        return obtener_configuracion_operativa(network["id"])
+    except STORAGE_ERRORS as error:
+        logger.exception("No se pudo consultar la configuración para el agente de %s", company["name"])
+        raise HTTPException(status_code=503, detail="No se pudo consultar la configuración de monitoreo.") from error
 
 
 @app.get("/auth/status")
@@ -183,6 +250,21 @@ def invitar_usuario(payload: auth.InviteRequest, request: Request, _user: dict =
     return auth.invite_user(_user, payload, request)
 
 
+@app.patch("/auth/admin/users/{username}")
+def actualizar_usuario(username: str, payload: auth.UserUpdateRequest, _user: dict = Depends(auth.require_company_admin)):
+    return auth.update_user(_user, username, payload)
+
+
+@app.delete("/auth/admin/invitations/{invite_id}")
+def anular_invitacion(invite_id: str, _user: dict = Depends(auth.require_company_admin)):
+    return auth.revoke_invitation(_user, invite_id)
+
+
+@app.post("/auth/admin/invitations/{invite_id}/resend")
+def reenviar_invitacion(invite_id: str, request: Request, _user: dict = Depends(auth.require_company_admin)):
+    return auth.resend_invitation(_user, invite_id, request)
+
+
 @app.post("/auth/accept-invitation")
 def aceptar_invitacion(payload: auth.AcceptInviteRequest, request: Request):
     return auth.accept_invite(payload, request)
@@ -214,36 +296,43 @@ def inicio():
     "/api/dispositivos",
     response_model=ListaDispositivos
 )
-def obtener_dispositivos(_user: str = Depends(auth.require_user)):
+def obtener_dispositivos(
+    red: int | None = Query(default=None, ge=1),
+    _user: str = Depends(auth.require_user),
+):
     try:
         verificar_base_datos()
         if _user.get("company_id", "default") != "default":
-            historial = obtener_inventario_conocido()
-            dispositivos = [Dispositivo(**device) for device in historial["dispositivos"]]
-            red = obtener_red_reciente() or {}
-            return {
-                "total": len(dispositivos), "dispositivos": dispositivos,
-                "puerta_enlace": red.get("gateway"), "ip_local": None,
-                "subred": red.get("cidr"),
-            }
+            return respuesta_guardada(red_solicitada(red), obtener_red_reciente())
         escaneo = descubrir_red_local()
         dispositivos = aplicar_confianza(escaneo["dispositivos"])
-        metadatos = obtener_metadatos_dispositivos([device.ip for device in dispositivos])
+        # The gateway's MAC tells which saved network this is, even when two share a subnet.
+        red_actual = identificar_red(escaneo.get("subred"), escaneo.get("puerta_enlace"), dispositivos)
+        metadatos = obtener_metadatos_dispositivos([device.ip for device in dispositivos], red_actual["id"])
         for device in dispositivos:
             metadata = metadatos.get(device.ip, {})
             device.responsable = metadata.get("responsable")
             device.notas = metadata.get("notas")
+        topologia = discover_lldp_topology(dispositivos)
     except DATABASE_CONFIGURATION_ERRORS as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except DATABASE_ERRORS as error:
         logger.exception("No se pudo consultar el inventario confiable")
-        raise HTTPException(status_code=503, detail="El inventario confiable no estÃ¡ disponible por el momento.") from error
+        raise HTTPException(status_code=503, detail="El inventario confiable no está disponible por el momento.") from error
 
     try:
-        registrar_eventos_escaneo(dispositivos, escaneo.get("subred"))
-        guardar_escaneo(dispositivos, escaneo.get("subred"), escaneo.get("puerta_enlace"))
+        registrar_eventos_escaneo(dispositivos, network_id=red_actual["id"])
+        guardar_escaneo(dispositivos, network_id=red_actual["id"])
+        guardar_topologia(red_actual["clave"], topologia)
     except STORAGE_ERRORS:
         logger.exception("No se pudo guardar el historial del escaneo")
+
+    if red is not None and red != red_actual["id"]:
+        try:
+            return respuesta_guardada(red_solicitada(red), red_actual)
+        except DATABASE_ERRORS as error:
+            logger.exception("No se pudo consultar la red guardada %s", red)
+            raise HTTPException(status_code=503, detail="La red guardada no está disponible por el momento.") from error
 
     return {
         "total": len(dispositivos),
@@ -251,15 +340,47 @@ def obtener_dispositivos(_user: str = Depends(auth.require_user)):
         "puerta_enlace": escaneo["puerta_enlace"],
         "ip_local": escaneo["ip_local"],
         "subred": escaneo["subred"],
+        "adaptador_red": escaneo.get("adaptador_red"),
+        "descripcion_adaptador": escaneo.get("descripcion_adaptador"),
+        "tipo_conexion": escaneo.get("tipo_conexion"),
+        "topologia": topologia,
+        "red": red_actual,
+        "red_actual": red_actual,
+        "en_vivo": True,
     }
 
 
+@app.get("/api/redes")
+def redes_guardadas(_user: str = Depends(auth.require_user)):
+    """Networks identified so far, one per gateway, newest first."""
+    try:
+        return listar_redes()
+    except STORAGE_ERRORS as error:
+        logger.exception("No se pudieron consultar las redes guardadas")
+        raise HTTPException(status_code=503, detail="Las redes guardadas no están disponibles por el momento.") from error
+
+
+@app.put("/api/redes/{red_id}")
+def renombrar_red_api(red_id: int, payload: RedRequest, _user: str = Depends(auth.require_company_admin)):
+    try:
+        red = renombrar_red(red_id, payload.nombre.strip() or None)
+    except STORAGE_ERRORS as error:
+        logger.exception("No se pudo renombrar la red %s", red_id)
+        raise HTTPException(status_code=503, detail="No se pudo guardar el nombre de la red.") from error
+    if red is None:
+        raise HTTPException(status_code=404, detail="La red seleccionada ya no está guardada.")
+    return red
+
+
 @app.get("/api/inventario")
-def inventario_conocido(_user: str = Depends(auth.require_user)):
-    """Return devices previously detected by GearEye on scanned local networks."""
+def inventario_conocido(
+    red: int | None = Query(default=None, ge=1),
+    _user: str = Depends(auth.require_user),
+):
+    """Return devices previously detected by GearEye on every saved network, or on one of them."""
     try:
         verificar_base_datos()
-        return obtener_inventario_conocido()
+        return obtener_inventario_conocido(red)
     except DATABASE_ERRORS as error:
         logger.exception("No se pudo consultar el inventario histórico")
         raise HTTPException(status_code=503, detail="El inventario histórico no está disponible por el momento.") from error
@@ -268,10 +389,11 @@ def inventario_conocido(_user: str = Depends(auth.require_user)):
 @app.get("/api/eventos")
 def eventos_red(
     limite: int = Query(default=30, ge=5, le=100),
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_user),
 ):
     try:
-        return obtener_eventos(limite)
+        return obtener_eventos(limite, red)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo consultar la bitácora de eventos")
         raise HTTPException(status_code=503, detail="La bitácora no está disponible por el momento.") from error
@@ -279,13 +401,14 @@ def eventos_red(
 @app.get("/api/alertas")
 def alertas_red(
     limite: int = Query(default=30, ge=1, le=100),
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_user),
 ):
     try:
-        return obtener_alertas(limite)
+        return obtener_alertas(limite, red)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudieron consultar las alertas")
-        raise HTTPException(status_code=503, detail="Las alertas no estÃ¡n disponibles por el momento.") from error
+        raise HTTPException(status_code=503, detail="Las alertas no están disponibles por el momento.") from error
 
 
 @app.post("/api/alertas/{alert_id}/reconocer")
@@ -300,12 +423,15 @@ def reconocer_alerta_red(alert_id: int, _user: str = Depends(auth.require_compan
 
 
 @app.get("/api/configuracion/monitoreo")
-def leer_configuracion_operativa(_user: str = Depends(auth.require_user)):
-    cidr = subred_sesion(_user)
-    if not cidr:
-        raise HTTPException(status_code=503, detail="A?n no se recibi? un escaneo del agente de esta empresa.")
+def leer_configuracion_operativa(
+    red: int | None = Query(default=None, ge=1),
+    _user: str = Depends(auth.require_user),
+):
     try:
-        return obtener_configuracion_operativa(cidr)
+        network_id = id_red(red)
+        if network_id is None:
+            raise HTTPException(status_code=503, detail="Aún no hay una red escaneada para configurar.")
+        return obtener_configuracion_operativa(network_id)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo consultar la configuraci\u00f3n operativa")
         raise HTTPException(status_code=503, detail="La configuraci\u00f3n no est\u00e1 disponible.") from error
@@ -314,29 +440,30 @@ def leer_configuracion_operativa(_user: str = Depends(auth.require_user)):
 @app.put("/api/configuracion/monitoreo")
 def guardar_configuracion_operativa_api(
     payload: ConfiguracionOperativa,
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_company_admin),
 ):
-    cidr = subred_sesion(_user)
-    if not cidr:
-        raise HTTPException(status_code=503, detail="A?n no se recibi? un escaneo del agente de esta empresa.")
     try:
-        return guardar_configuracion_operativa(cidr, payload.model_dump())
+        network_id = id_red(red)
+        if network_id is None:
+            raise HTTPException(status_code=503, detail="Aún no hay una red escaneada para configurar.")
+        return guardar_configuracion_operativa(network_id, payload.model_dump())
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo guardar la configuraci\u00f3n operativa")
         raise HTTPException(status_code=503, detail="No se pudo guardar la configuraci\u00f3n.") from error
 
 
 @app.get("/api/dispositivos/{ip}/notas")
-def leer_notas_dispositivo(ip: str, _user: str = Depends(auth.require_user)):
+def leer_notas_dispositivo(ip: str, red: int | None = Query(default=None, ge=1), _user: str = Depends(auth.require_user)):
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
-    cidr = subred_sesion(_user)
+    cidr = subred_sesion(_user, red)
     if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes consultar equipos de la subred local.")
     try:
-        result = obtener_notas_dispositivo(str(ip_validada))
+        result = obtener_notas_dispositivo(str(ip_validada), id_red(red))
         if result is None:
             raise HTTPException(status_code=404, detail="Escanea el equipo antes de consultar sus notas.")
         return result
@@ -349,18 +476,20 @@ def leer_notas_dispositivo(ip: str, _user: str = Depends(auth.require_user)):
 def guardar_notas_dispositivo_api(
     ip: str,
     payload: NotasDispositivoRequest,
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_company_admin),
 ):
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="La direcci\u00f3n debe ser una IPv4 v\u00e1lida.") from error
-    cidr = subred_sesion(_user)
+    cidr = subred_sesion(_user, red)
     if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes modificar equipos de la subred local.")
     try:
         result = guardar_notas_dispositivo(
-            str(ip_validada), payload.responsable.strip() or None, payload.notas.strip() or None
+            str(ip_validada), payload.responsable.strip() or None, payload.notas.strip() or None,
+            id_red(red),
         )
         if result is None:
             raise HTTPException(status_code=404, detail="Escanea el equipo antes de guardar notas.")
@@ -373,10 +502,11 @@ def guardar_notas_dispositivo_api(
 @app.get("/api/eventos.csv")
 def exportar_eventos_csv(
     dias: int = Query(default=30, ge=1, le=180),
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_user),
 ):
     try:
-        events = obtener_eventos_exportables(dias)
+        events = obtener_eventos_exportables(dias, red)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo exportar la bit\u00e1cora")
         raise HTTPException(status_code=503, detail="No se pudo exportar la bit\u00e1cora.") from error
@@ -406,13 +536,14 @@ def exportar_eventos_csv(
 def confianza_dispositivo(
     ip: str,
     payload: ConfianzaRequest,
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_company_admin),
 ):
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
-        raise HTTPException(status_code=422, detail="La direcciÃ³n debe ser una IPv4 vÃ¡lida.") from error
-    cidr = subred_sesion(_user)
+        raise HTTPException(status_code=422, detail="La dirección debe ser una IPv4 válida.") from error
+    cidr = subred_sesion(_user, red)
     if not cidr or ip_validada not in IPv4Network(cidr):
         raise HTTPException(status_code=403, detail="Solo puedes administrar equipos de la subred local.")
     try:
@@ -430,13 +561,39 @@ def confianza_dispositivo(
         raise HTTPException(status_code=503, detail="No se pudo guardar el inventario de confianza.") from error
 
 
+@app.get("/api/analisis-ia")
+def analisis_ia_red(
+    dias: int = Query(default=7, ge=1, le=30),
+    red: int | None = Query(default=None, ge=1),
+    _user: str = Depends(auth.require_user),
+):
+    """Diagnose one network from its stored scans: learned latency baselines plus correlation rules."""
+    try:
+        red_vista = red_solicitada(red) or {}
+        datos = obtener_datos_analisis(dias, network_id=red_vista.get("id"))
+        topologia = obtener_topologia(red_vista.get("clave"))
+    except STORAGE_ERRORS as error:
+        logger.exception("No se pudo preparar el análisis de IA")
+        raise HTTPException(status_code=503, detail="El análisis no está disponible por el momento.") from error
+    resultado = analizar_red(
+        datos["series"], gateway=red_vista.get("gateway"),
+        ips_confiables=datos["ips_confiables"], macs_confiables=datos["macs_confiables"],
+        topologia=topologia,
+    )
+    resultado["generado_en"] = datetime.now(timezone.utc).isoformat()
+    resultado["dias"] = dias
+    resultado["red"] = red_vista or None
+    return resultado
+
+
 @app.get("/api/informes")
 def informe_red(
     dias: int = Query(default=7, ge=1, le=30),
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_user),
 ):
     try:
-        return obtener_datos_informe(dias)
+        return obtener_datos_informe(dias, red)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo generar el informe de red")
         raise HTTPException(status_code=503, detail="El informe no está disponible por el momento.") from error
@@ -445,10 +602,11 @@ def informe_red(
 @app.get("/api/informes.csv")
 def descargar_informe_csv(
     dias: int = Query(default=7, ge=1, le=30),
+    red: int | None = Query(default=None, ge=1),
     _user: str = Depends(auth.require_user),
 ):
     try:
-        informe = obtener_datos_informe(dias)
+        informe = obtener_datos_informe(dias, red)
     except STORAGE_ERRORS as error:
         logger.exception("No se pudo generar el informe CSV de red")
         raise HTTPException(status_code=503, detail="El informe no está disponible por el momento.") from error
@@ -513,7 +671,7 @@ def descargar_informe_csv(
 @app.get("/api/comprobar/{ip}", response_model=Dispositivo)
 def comprobar_ip(ip: str, _user: str = Depends(auth.require_user)):
     if _user.get("company_id", "default") != "default":
-        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
+        raise HTTPException(status_code=409, detail="Este diagnóstico se debe ejecutar desde el agente instalado en la red de la empresa.")
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
@@ -526,7 +684,7 @@ def comprobar_ip(ip: str, _user: str = Depends(auth.require_user)):
 @app.get("/api/diagnostico/{ip}", response_model=ResultadoDiagnostico)
 def diagnostico_ip(ip: str, _user: str = Depends(auth.require_company_admin)):
     if _user.get("company_id", "default") != "default":
-        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
+        raise HTTPException(status_code=409, detail="Este diagnóstico se debe ejecutar desde el agente instalado en la red de la empresa.")
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
@@ -551,7 +709,7 @@ def diagnostico_ip(ip: str, _user: str = Depends(auth.require_company_admin)):
 @app.post("/api/diagnostico-avanzado/{ip}")
 def diagnostico_avanzado_ip(ip: str, _user: str = Depends(auth.require_company_admin)):
     if _user.get("company_id", "default") != "default":
-        raise HTTPException(status_code=409, detail="Este diagn?stico se debe ejecutar desde el agente instalado en la red de la empresa.")
+        raise HTTPException(status_code=409, detail="Este diagnóstico se debe ejecutar desde el agente instalado en la red de la empresa.")
     try:
         ip_validada = IPv4Address(ip)
     except ValueError as error:
@@ -580,4 +738,30 @@ def historial_ip(
         raise HTTPException(
             status_code=503,
             detail="El historial de latencia no está disponible por el momento.",
+        ) from error
+
+@app.get("/api/historial-equipo")
+def historial_equipo(
+    ip: list[str] = Query(...),
+    limite: int = Query(default=30, ge=5, le=180),
+    red: int | None = Query(default=None, ge=1),
+    _user: str = Depends(auth.require_user),
+):
+    if not ip or len(ip) > 32:
+        raise HTTPException(status_code=422, detail="Indica entre 1 y 32 direcciones IP.")
+    ips = []
+    for value in ip:
+        try:
+            normalized = str(IPv4Address(value))
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Cada IP debe ser una IPv4 valida.") from error
+        if normalized not in ips:
+            ips.append(normalized)
+    try:
+        return obtener_historial_equipo(ips, limite, red)
+    except STORAGE_ERRORS as error:
+        logger.exception("No se pudo consultar el historial unificado del equipo")
+        raise HTTPException(
+            status_code=503,
+            detail="El historial del equipo no esta disponible por el momento.",
         ) from error

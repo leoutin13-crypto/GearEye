@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 Backend/data/auth_state.*
+*.bak
+.pytest_cache/

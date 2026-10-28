@@ -2,6 +2,7 @@
 
 import os
 import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -49,12 +50,24 @@ def _connect():
 
 def _ensure_postgresql_schema(connection):
     connection.execute(
+        """CREATE TABLE IF NOT EXISTS network_topology (
+            cidr TEXT PRIMARY KEY,
+            captured_at DOUBLE PRECISION NOT NULL,
+            data_json TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
         """CREATE TABLE IF NOT EXISTS networks (
             id BIGSERIAL PRIMARY KEY,
             name TEXT NOT NULL,
-            cidr TEXT NOT NULL UNIQUE,
+            cidr TEXT NOT NULL,
             gateway TEXT,
+            gateway_mac TEXT,
+            gateway_vendor TEXT,
+            alias TEXT,
+            network_key TEXT,
             created_at DOUBLE PRECISION NOT NULL,
+            last_seen_at DOUBLE PRECISION,
             is_demo BOOLEAN NOT NULL DEFAULT FALSE,
             monitor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
@@ -89,8 +102,15 @@ def _ensure_postgresql_schema(connection):
         ("alert_latency_threshold_ms", "DOUBLE PRECISION NOT NULL DEFAULT 300"),
         ("alert_new_devices", "BOOLEAN NOT NULL DEFAULT TRUE"),
         ("alert_offline_devices", "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("gateway_mac", "TEXT"),
+        ("gateway_vendor", "TEXT"),
+        ("alias", "TEXT"),
+        ("network_key", "TEXT"),
+        ("last_seen_at", "DOUBLE PRECISION"),
     ):
         connection.execute(f"ALTER TABLE networks ADD COLUMN IF NOT EXISTS {name} {data_type}")
+    # Una red se identifica por subred + MAC del gateway (network_key), no solo por subred.
+    connection.execute("ALTER TABLE networks DROP CONSTRAINT IF EXISTS networks_cidr_key")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS scan_runs (
             scan_id TEXT PRIMARY KEY,
@@ -169,6 +189,10 @@ def _ensure_postgresql_schema(connection):
     )
     connection.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS device_id BIGINT REFERENCES devices(id)")
     connection.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE")
+    connection.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS network_id BIGINT REFERENCES networks(id)")
+    for statement in _BACKFILL_NETWORKS:
+        connection.execute(statement)
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_key ON networks(network_key)")
     connection.execute("ALTER TABLE measurements ADD COLUMN IF NOT EXISTS device_id BIGINT REFERENCES devices(id)")
     connection.execute("ALTER TABLE measurements ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE")
     connection.execute("ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS network_id BIGINT REFERENCES networks(id)")
@@ -178,6 +202,8 @@ def _ensure_postgresql_schema(connection):
     connection.execute("ALTER TABLE trusted_devices ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE")
     connection.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS owner TEXT")
     connection.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS notes TEXT")
+    connection.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS os_guess TEXT")
+    connection.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS open_ports TEXT")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS diagnostics (
             id BIGSERIAL PRIMARY KEY,
@@ -240,6 +266,52 @@ def _ensure_postgresql_schema(connection):
     )
 
 
+# Backfill shared by both engines: rows from earlier versions get a key and a last-seen time,
+# and events learn their network from the device they belong to.
+_BACKFILL_NETWORKS = (
+    "UPDATE networks SET network_key = cidr || '|' || COALESCE(gateway_mac, '') WHERE network_key IS NULL",
+    """UPDATE networks SET last_seen_at = COALESCE(
+           (SELECT MAX(captured_at) FROM scan_runs WHERE scan_runs.network_id = networks.id), created_at)
+       WHERE last_seen_at IS NULL""",
+    """UPDATE events SET network_id = (SELECT network_id FROM devices WHERE devices.id = events.device_id)
+       WHERE network_id IS NULL AND device_id IS NOT NULL""",
+)
+
+_SQLITE_NETWORKS_TABLE = """CREATE TABLE IF NOT EXISTS networks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    cidr TEXT NOT NULL,
+    gateway TEXT,
+    created_at REAL NOT NULL,
+    is_demo INTEGER NOT NULL DEFAULT 0,
+    monitor_enabled INTEGER NOT NULL DEFAULT 0,
+    monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
+    alert_latency_threshold_ms REAL NOT NULL DEFAULT 300,
+    alert_new_devices INTEGER NOT NULL DEFAULT 1,
+    alert_offline_devices INTEGER NOT NULL DEFAULT 1,
+    gateway_mac TEXT,
+    gateway_vendor TEXT,
+    alias TEXT,
+    network_key TEXT,
+    last_seen_at REAL
+)"""
+
+
+def _sqlite_drop_unique_cidr(connection):
+    """SQLite cannot drop a UNIQUE constraint, so the table is rebuilt keeping every id."""
+    columns = ", ".join(row["name"] for row in connection.execute("PRAGMA table_info(networks)"))
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute(_SQLITE_NETWORKS_TABLE.replace("networks", "networks_rebuilt", 1))
+        connection.execute(f"INSERT INTO networks_rebuilt({columns}) SELECT {columns} FROM networks")
+        connection.execute("DROP TABLE networks")
+        connection.execute("ALTER TABLE networks_rebuilt RENAME TO networks")
+        connection.commit()
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
 def _connect_sqlite():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     company_id = active_company_id.get() or "default"
@@ -249,20 +321,13 @@ def _connect_sqlite():
     connection.execute("PRAGMA busy_timeout = 15000")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(
-        """CREATE TABLE IF NOT EXISTS networks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            cidr TEXT NOT NULL UNIQUE,
-            gateway TEXT,
-            created_at REAL NOT NULL,
-            is_demo INTEGER NOT NULL DEFAULT 0,
-            monitor_enabled INTEGER NOT NULL DEFAULT 0,
-            monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
-            alert_latency_threshold_ms REAL NOT NULL DEFAULT 300,
-            alert_new_devices INTEGER NOT NULL DEFAULT 1,
-            alert_offline_devices INTEGER NOT NULL DEFAULT 1
+        """CREATE TABLE IF NOT EXISTS network_topology (
+            cidr TEXT PRIMARY KEY,
+            captured_at REAL NOT NULL,
+            data_json TEXT NOT NULL
         )"""
     )
+    connection.execute(_SQLITE_NETWORKS_TABLE)
     network_columns = {row["name"] for row in connection.execute("PRAGMA table_info(networks)")}
     for name, data_type in (
         ("monitor_enabled", "INTEGER NOT NULL DEFAULT 0"),
@@ -270,9 +335,17 @@ def _connect_sqlite():
         ("alert_latency_threshold_ms", "REAL NOT NULL DEFAULT 300"),
         ("alert_new_devices", "INTEGER NOT NULL DEFAULT 1"),
         ("alert_offline_devices", "INTEGER NOT NULL DEFAULT 1"),
+        ("gateway_mac", "TEXT"),
+        ("gateway_vendor", "TEXT"),
+        ("alias", "TEXT"),
+        ("network_key", "TEXT"),
+        ("last_seen_at", "REAL"),
     ):
         if name not in network_columns:
             connection.execute(f"ALTER TABLE networks ADD COLUMN {name} {data_type}")
+    # Earlier versions keyed networks by subnet alone (UNIQUE(cidr)).
+    if any(index["origin"] == "u" for index in connection.execute("PRAGMA index_list(networks)")):
+        _sqlite_drop_unique_cidr(connection)
     connection.execute(
         """CREATE TABLE IF NOT EXISTS scan_runs (
             scan_id TEXT PRIMARY KEY,
@@ -307,7 +380,7 @@ def _connect_sqlite():
         )"""
     )
     device_columns = {row["name"] for row in connection.execute("PRAGMA table_info(devices)")}
-    for name in ("owner", "notes"):
+    for name in ("owner", "notes", "os_guess", "open_ports"):
         if name not in device_columns:
             connection.execute(f"ALTER TABLE devices ADD COLUMN {name} TEXT")
     connection.execute(
@@ -361,9 +434,12 @@ def _connect_sqlite():
     event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)")}
     if "acknowledged_at" not in event_columns:
         connection.execute("ALTER TABLE events ADD COLUMN acknowledged_at REAL")
-    for name, data_type in (("device_id", "INTEGER"), ("is_demo", "INTEGER NOT NULL DEFAULT 0")):
+    for name, data_type in (("device_id", "INTEGER"), ("is_demo", "INTEGER NOT NULL DEFAULT 0"), ("network_id", "INTEGER")):
         if name not in event_columns:
             connection.execute(f"ALTER TABLE events ADD COLUMN {name} {data_type}")
+    for statement in _BACKFILL_NETWORKS:
+        connection.execute(statement)
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_key ON networks(network_key)")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS trusted_devices (
@@ -414,45 +490,180 @@ def _connect_sqlite():
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_time ON events(occurred_at DESC)"
     )
+    connection.commit()
     return connection
 
 
-def guardar_escaneo(dispositivos, cidr=None, gateway=None):
+def _mac_normalizada(mac):
+    return mac.strip().lower().replace(":", "-") if mac else None
+
+
+def _iso(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat() if timestamp else None
+
+
+# Measurements reach their network through the device row they were stored for.
+NET_FILTER_SQL = "device_id IN (SELECT id FROM devices WHERE network_id = ?)"
+
+_NETWORK_COLUMNS = "id, name, alias, cidr, gateway, gateway_mac, gateway_vendor, network_key, created_at, last_seen_at"
+
+
+def _red_publica(row):
+    vendor = row["gateway_vendor"]
+    return {
+        "id": row["id"],
+        "nombre": row["alias"] or (f"Red {vendor} · {row['cidr']}" if vendor else f"Red {row['cidr']}"),
+        "alias": row["alias"],
+        "subred": row["cidr"],
+        "gateway": row["gateway"],
+        "gateway_mac": row["gateway_mac"],
+        "gateway_fabricante": vendor,
+        "clave": row["network_key"],
+        "primera_vez": _iso(row["created_at"]),
+        "ultima_vez": _iso(row["last_seen_at"] or row["created_at"]),
+    }
+
+
+def identificar_red(cidr, gateway=None, dispositivos=()):
+    """Return the saved network a scan belongs to, registering it the first time its gateway appears.
+
+    A network is its subnet plus the gateway MAC, so two routers that hand out the same
+    subnet (192.168.1.0/24 at home and at the office) are kept as separate networks.
+    """
+    cidr = cidr or "red-desconocida"
+    router = next((device for device in dispositivos if gateway and device.ip == gateway), None)
+    gateway_mac = _mac_normalizada(router.mac) if router else None
+    gateway_vendor = (router.fabricante or router.fabricante_red) if router else None
+    if gateway_vendor in {"Desconocido", "MAC privada"}:
+        gateway_vendor = None
+    key = f"{cidr}|{gateway_mac or ''}"
+    now = time.time()
+    connection = _connect()
+    try:
+        with connection:
+            row = connection.execute(
+                "SELECT id FROM networks WHERE network_key = ? AND is_demo = FALSE", (key,)
+            ).fetchone()
+            if row is None:
+                # A network saved without a gateway MAC (earlier versions, or a scan where the
+                # router missed the ARP table) is claimed the first time its MAC shows up.
+                query = "SELECT id FROM networks WHERE cidr = ? AND is_demo = FALSE"
+                if gateway_mac:
+                    query += " AND gateway_mac IS NULL"
+                row = connection.execute(
+                    query + " ORDER BY COALESCE(last_seen_at, created_at) DESC LIMIT 1", (cidr,)
+                ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO networks(name, cidr, gateway, gateway_mac, gateway_vendor,
+                                           network_key, created_at, last_seen_at, is_demo)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE)""",
+                    (f"Red {cidr}", cidr, gateway, gateway_mac, gateway_vendor, key, now, now),
+                )
+                network_id = connection.execute(
+                    "SELECT id FROM networks WHERE network_key = ? AND is_demo = FALSE", (key,)
+                ).fetchone()["id"]
+            else:
+                network_id = row["id"]
+                connection.execute(
+                    """UPDATE networks SET gateway = COALESCE(?, gateway),
+                              gateway_mac = COALESCE(?, gateway_mac),
+                              gateway_vendor = COALESCE(?, gateway_vendor),
+                              network_key = COALESCE(?, network_key), last_seen_at = ?
+                       WHERE id = ?""",
+                    (gateway, gateway_mac, gateway_vendor, key if gateway_mac else None, now, network_id),
+                )
+    finally:
+        connection.close()
+    return obtener_red(network_id)
+
+
+def obtener_red(network_id):
+    connection = _connect()
+    try:
+        row = connection.execute(
+            f"SELECT {_NETWORK_COLUMNS} FROM networks WHERE id = ? AND is_demo = FALSE", (network_id,)
+        ).fetchone()
+        return _red_publica(row) if row else None
+    finally:
+        connection.close()
+
+
+def listar_redes():
+    """List every saved network with its device count and the result of its latest scan."""
+    connection = _connect()
+    try:
+        rows = connection.execute(
+            f"""SELECT {", ".join("n." + column for column in _NETWORK_COLUMNS.split(", "))},
+                   (SELECT COUNT(*) FROM devices AS d
+                    WHERE d.network_id = n.id AND d.is_demo = FALSE) AS device_count,
+                   (SELECT COUNT(*) FROM scan_runs AS sr
+                    WHERE sr.network_id = n.id AND sr.is_complete = TRUE) AS scan_count,
+                   (SELECT COUNT(*) FROM measurements AS m
+                    WHERE m.state = 'activo' AND m.scan_id = (
+                        SELECT sr.scan_id FROM scan_runs AS sr
+                        WHERE sr.network_id = n.id AND sr.is_complete = TRUE
+                        ORDER BY sr.captured_at DESC LIMIT 1)) AS active_count
+               FROM networks AS n
+               WHERE n.is_demo = FALSE
+               ORDER BY COALESCE(n.last_seen_at, n.created_at) DESC"""
+        ).fetchall()
+    finally:
+        connection.close()
+    redes = []
+    for row in rows:
+        red = _red_publica(row)
+        red.update(equipos=row["device_count"], escaneos=row["scan_count"], activos=row["active_count"])
+        redes.append(red)
+    return {"total": len(redes), "reciente": redes[0]["id"] if redes else None, "redes": redes}
+
+
+def renombrar_red(network_id, alias):
+    connection = _connect()
+    try:
+        with connection:
+            cursor = connection.execute(
+                "UPDATE networks SET alias = ? WHERE id = ? AND is_demo = FALSE", (alias, network_id)
+            )
+        if cursor.rowcount == 0:
+            return None
+    finally:
+        connection.close()
+    return obtener_red(network_id)
+
+
+def guardar_escaneo(dispositivos, cidr=None, gateway=None, network_id=None):
     """Store one point per discovered device; non-responders have no latency."""
     if not dispositivos:
         return
 
     scan_id = str(uuid.uuid4())
     captured_at = time.time()
-    cidr = cidr or "red-desconocida"
+    if network_id is None:
+        network_id = identificar_red(cidr, gateway, dispositivos)["id"]
 
     connection = _connect()
     try:
         with connection:
-            connection.execute(
-                """INSERT INTO networks(name, cidr, gateway, created_at, is_demo)
-                   VALUES (?, ?, ?, ?, FALSE)
-                   ON CONFLICT(cidr) DO UPDATE SET name=excluded.name, gateway=excluded.gateway""",
-                (f"Red {cidr}", cidr, gateway, captured_at),
-            )
-            network_id = connection.execute(
-                "SELECT id FROM networks WHERE cidr = ? AND is_demo = FALSE", (cidr,)
-            ).fetchone()["id"]
             device_ids = {}
             for device in dispositivos:
                 connection.execute(
                     """INSERT INTO devices(
                            network_id, ip, mac, name, manufacturer, manufacturer_network,
-                           model, device_type, current_state, first_seen, last_seen, is_demo
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+                           model, device_type, current_state, first_seen, last_seen,
+                           os_guess, open_ports, is_demo
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
                        ON CONFLICT(network_id, ip) DO UPDATE SET
                            mac=excluded.mac, name=excluded.name, manufacturer=excluded.manufacturer,
                            manufacturer_network=excluded.manufacturer_network, model=excluded.model,
                            device_type=excluded.device_type, current_state=excluded.current_state,
-                           last_seen=excluded.last_seen""",
+                           last_seen=excluded.last_seen,
+                           os_guess=COALESCE(excluded.os_guess, devices.os_guess),
+                           open_ports=COALESCE(excluded.open_ports, devices.open_ports)""",
                     (network_id, device.ip, device.mac, device.nombre, device.fabricante,
                      device.fabricante_red, device.modelo, device.tipo, device.estado,
-                     captured_at, captured_at),
+                     captured_at, captured_at, device.sistema,
+                     ",".join(str(port) for port in device.puertos) or None),
                 )
                 device_ids[device.ip] = connection.execute(
                     "SELECT id FROM devices WHERE network_id = ? AND ip = ? AND is_demo = FALSE",
@@ -508,14 +719,15 @@ def guardar_escaneo(dispositivos, cidr=None, gateway=None):
         connection.close()
 
 
-def obtener_inventario_conocido():
-    """List devices previously discovered on scanned local networks."""
+def obtener_inventario_conocido(network_id=None):
+    """List devices previously discovered on scanned local networks, or on one of them."""
     connection = _connect()
     try:
         rows = connection.execute(
             """
             SELECT d.ip, d.mac, d.name, d.manufacturer, d.manufacturer_network,
-                   d.model, d.device_type, d.first_seen, d.last_seen, n.cidr,
+                   d.model, d.device_type, d.first_seen, d.last_seen, n.cidr, d.network_id,
+                   d.owner, d.notes, d.os_guess, d.open_ports,
                    (SELECT m.state FROM measurements AS m
                     WHERE m.device_id = d.id AND m.is_demo = FALSE
                     ORDER BY m.captured_at DESC, m.id DESC LIMIT 1) AS latest_state,
@@ -524,12 +736,27 @@ def obtener_inventario_conocido():
                     ORDER BY m.captured_at DESC, m.id DESC LIMIT 1) AS latest_latency
             FROM devices AS d
             LEFT JOIN networks AS n ON n.id = d.network_id
-            WHERE d.is_demo = FALSE
+            WHERE d.is_demo = FALSE""" + (" AND d.network_id = ?" if network_id is not None else "") + """
             ORDER BY d.last_seen DESC, d.ip
-            """
+            """,
+            (network_id,) if network_id is not None else (),
+        ).fetchall()
+        trusted_rows = connection.execute(
+            "SELECT ip, mac FROM trusted_devices WHERE is_demo = FALSE"
         ).fetchall()
     finally:
         connection.close()
+
+    trusted_ips = {row["ip"]: row["mac"] for row in trusted_rows}
+    trusted_macs = {row["mac"].lower().replace(":", "-") for row in trusted_rows if row["mac"]}
+
+    def trust_state(ip, mac):
+        normalized = mac.lower().replace(":", "-") if mac else None
+        if normalized and normalized in trusted_macs:
+            return "confiable"
+        if ip in trusted_ips and (trusted_ips[ip] is None or mac is None):
+            return "confiable"
+        return "por_revisar"
 
     def iso(timestamp):
         return datetime.fromtimestamp(timestamp, timezone.utc).isoformat() if timestamp else None
@@ -543,11 +770,75 @@ def obtener_inventario_conocido():
             "tiempo_respuesta": row["latest_latency"],
             "primera_deteccion": iso(row["first_seen"]),
             "ultima_deteccion": iso(row["last_seen"]),
-            "subred": row["cidr"],
+            "subred": row["cidr"], "red_id": row["network_id"],
+            "responsable": row["owner"], "notas": row["notes"],
+            "sistema": row["os_guess"],
+            "puertos": [int(port) for port in (row["open_ports"] or "").split(",") if port.isdigit()],
+            "confianza": trust_state(row["ip"], row["mac"]),
         }
         for row in rows
     ]
-    return {"total": len(devices), "dispositivos": devices}
+    groups = []
+    for red_id in dict.fromkeys(device["red_id"] for device in devices):
+        groups.extend(_group_device_identities([device for device in devices if device["red_id"] == red_id]))
+    merged = []
+    for group in groups:
+        latest = max(group, key=lambda device: device["ultima_deteccion"] or "")
+        item = dict(latest)
+        item["ips"] = sorted({device["ip"] for device in group})
+        item["subredes"] = sorted({device["subred"] for device in group if device["subred"]})
+        item["primera_deteccion"] = min(
+            (device["primera_deteccion"] for device in group if device["primera_deteccion"]),
+            default=None,
+        )
+        item["ultima_deteccion"] = max(
+            (device["ultima_deteccion"] for device in group if device["ultima_deteccion"]),
+            default=None,
+        )
+        merged.append(item)
+    merged.sort(key=lambda device: device["ultima_deteccion"] or "", reverse=True)
+    return {"total": len(merged), "dispositivos": merged}
+
+
+def _normalized_identity_value(value):
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _same_device_identity(left, right):
+    left_mac = _normalized_identity_value(left.get("mac")).replace(":", "-")
+    right_mac = _normalized_identity_value(right.get("mac")).replace(":", "-")
+    if left_mac and right_mac and left_mac == right_mac:
+        return True
+
+    left_name = _normalized_identity_value(left.get("nombre") or left.get("name"))
+    right_name = _normalized_identity_value(right.get("nombre") or right.get("name"))
+    generic_names = {"", "desconocido", "unknown", "dispositivo", "device", "mac privada"}
+    if left_name in generic_names or left_name != right_name:
+        return False
+
+    # Hostnames can bridge subnet scans when a MAC is missing or changes.
+    # Conflicting manufacturer or model data keeps the records separate.
+    for key in ("fabricante", "modelo"):
+        left_value = _normalized_identity_value(left.get(key))
+        right_value = _normalized_identity_value(right.get(key))
+        if left_value and right_value and left_value != right_value:
+            return False
+    return True
+
+
+def _group_device_identities(devices):
+    groups = []
+    for device in devices:
+        matching = [index for index, group in enumerate(groups)
+                    if any(_same_device_identity(device, member) for member in group)]
+        if not matching:
+            groups.append([device])
+            continue
+        first = matching[0]
+        groups[first].append(device)
+        for index in reversed(matching[1:]):
+            groups[first].extend(groups.pop(index))
+    return groups
 
 
 def _refresh_postgresql_views(connection):
@@ -589,24 +880,55 @@ def verificar_base_datos():
 
 
 def obtener_red_reciente():
+    """Return the network scanned most recently: the one this computer or agent is on."""
     connection = _connect()
     try:
         row = connection.execute(
-            "SELECT cidr, gateway FROM networks WHERE is_demo = FALSE ORDER BY created_at DESC LIMIT 1"
+            f"""SELECT {_NETWORK_COLUMNS} FROM networks WHERE is_demo = FALSE
+                ORDER BY COALESCE(last_seen_at, created_at) DESC LIMIT 1"""
         ).fetchone()
-        return dict(row) if row else None
+        return _red_publica(row) if row else None
     finally:
         connection.close()
 
 
-def obtener_configuracion_operativa(cidr):
+def guardar_topologia(cidr, topologia):
+    if not cidr or not isinstance(topologia, dict):
+        return
+    connection = _connect()
+    try:
+        connection.execute(
+            """INSERT INTO network_topology(cidr, captured_at, data_json) VALUES (?, ?, ?)
+               ON CONFLICT(cidr) DO UPDATE SET captured_at=excluded.captured_at,
+               data_json=excluded.data_json""",
+            (str(cidr), time.time(), json.dumps(topologia, ensure_ascii=False)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def obtener_topologia(cidr):
+    if not cidr:
+        return None
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT data_json FROM network_topology WHERE cidr = ?", (str(cidr),)
+        ).fetchone()
+        return json.loads(row["data_json"]) if row else None
+    finally:
+        connection.close()
+
+
+def obtener_configuracion_operativa(network_id):
     connection = _connect()
     try:
         row = connection.execute(
             """SELECT monitor_enabled, monitor_interval_minutes,
                       alert_latency_threshold_ms, alert_new_devices, alert_offline_devices
-               FROM networks WHERE cidr = ? AND is_demo = FALSE""",
-            (cidr,),
+               FROM networks WHERE id = ? AND is_demo = FALSE""",
+            (network_id,),
         ).fetchone()
         if row is None:
             return {
@@ -627,119 +949,123 @@ def obtener_configuracion_operativa(cidr):
         connection.close()
 
 
-def guardar_configuracion_operativa(cidr, configuracion):
-    now = time.time()
+def guardar_configuracion_operativa(network_id, configuracion):
     connection = _connect()
     try:
         with connection:
             connection.execute(
-                """INSERT INTO networks(name, cidr, created_at, is_demo)
-                   VALUES (?, ?, ?, FALSE)
-                   ON CONFLICT(cidr) DO NOTHING""",
-                (f"Red {cidr}", cidr, now),
-            )
-            connection.execute(
                 """UPDATE networks SET monitor_enabled = ?, monitor_interval_minutes = ?,
                           alert_latency_threshold_ms = ?, alert_new_devices = ?, alert_offline_devices = ?
-                   WHERE cidr = ? AND is_demo = FALSE""",
+                   WHERE id = ? AND is_demo = FALSE""",
                 (
                     configuracion["monitoreo_activo"],
                     configuracion["intervalo_minutos"],
                     configuracion["umbral_latencia_ms"],
                     configuracion["alertar_dispositivo_nuevo"],
                     configuracion["alertar_dispositivo_ausente"],
-                    cidr,
+                    network_id,
                 ),
             )
-        return obtener_configuracion_operativa(cidr)
+        return obtener_configuracion_operativa(network_id)
     finally:
         connection.close()
 
 
-def guardar_notas_dispositivo(ip, responsable, notas):
+def _filtro_red(network_id, column="network_id"):
+    return (f" AND {column} = ?", (network_id,)) if network_id is not None else ("", ())
+
+
+def guardar_notas_dispositivo(ip, responsable, notas, network_id=None):
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         with connection:
             row = connection.execute(
-                """UPDATE devices SET owner = ?, notes = ?
+                f"""UPDATE devices SET owner = ?, notes = ?
                    WHERE id = (
-                       SELECT id FROM devices WHERE ip = ? AND is_demo = FALSE
+                       SELECT id FROM devices WHERE ip = ? AND is_demo = FALSE{filtro}
                        ORDER BY last_seen DESC LIMIT 1
                    ) RETURNING ip, owner, notes""",
-                (responsable, notas, ip),
+                (responsable, notas, ip, *parametros),
             ).fetchone()
         return dict(row) if row else None
     finally:
         connection.close()
 
 
-def obtener_notas_dispositivo(ip):
+def obtener_notas_dispositivo(ip, network_id=None):
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         row = connection.execute(
-            """SELECT owner, notes FROM devices WHERE ip = ? AND is_demo = FALSE
+            f"""SELECT owner, notes FROM devices WHERE ip = ? AND is_demo = FALSE{filtro}
                ORDER BY last_seen DESC LIMIT 1""",
-            (ip,),
+            (ip, *parametros),
         ).fetchone()
         return {"responsable": row["owner"], "notas": row["notes"]} if row else None
     finally:
         connection.close()
 
 
-def obtener_metadatos_dispositivos(ips):
+def obtener_metadatos_dispositivos(ips, network_id=None):
     if not ips:
         return {}
     placeholders = ", ".join("?" for _ in ips)
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         rows = connection.execute(
-            f"SELECT ip, owner, notes FROM devices WHERE is_demo = FALSE AND ip IN ({placeholders})",
-            tuple(ips),
+            f"SELECT ip, owner, notes FROM devices WHERE is_demo = FALSE AND ip IN ({placeholders}){filtro}",
+            (*ips, *parametros),
         ).fetchall()
         return {row["ip"]: {"responsable": row["owner"], "notas": row["notes"]} for row in rows}
     finally:
         connection.close()
 
 
-def obtener_eventos_exportables(dias=30):
+def obtener_eventos_exportables(dias=30, network_id=None):
     cutoff = time.time() - dias * 24 * 60 * 60
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         rows = connection.execute(
-            """SELECT occurred_at, ip, device_name, event_type, previous_state,
+            f"""SELECT occurred_at, ip, device_name, event_type, previous_state,
                       current_state, description, acknowledged_at
-               FROM events WHERE occurred_at >= ? AND is_demo = FALSE
+               FROM events WHERE occurred_at >= ? AND is_demo = FALSE{filtro}
                ORDER BY occurred_at DESC""",
-            (cutoff,),
+            (cutoff, *parametros),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
         connection.close()
 
 
-def registrar_eventos_escaneo(dispositivos, cidr=None):
-    """Store first sightings and state transitions between completed scans."""
+def registrar_eventos_escaneo(dispositivos, cidr=None, network_id=None):
+    """Store first sightings and state transitions against the previous scan of the same network."""
     current = {device.ip: device for device in dispositivos}
+    # Resolve the network and read settings before opening the write connection:
+    # a second SQLite connection would otherwise wait on this one's open transaction.
+    if network_id is None:
+        network_id = identificar_red(cidr, None, dispositivos)["id"]
+    settings = obtener_configuracion_operativa(network_id)
     connection = _connect()
     try:
         now = time.time()
-        settings = obtener_configuracion_operativa(cidr) if cidr else {
-            "umbral_latencia_ms": 300,
-            "alertar_dispositivo_nuevo": True,
-            "alertar_dispositivo_ausente": True,
-        }
         with connection:
+            # Comparing with every network would report the devices of the network
+            # the laptop just left as absent, and every device here as new.
             rows = connection.execute(
-                """
+                f"""
                 SELECT m.ip, m.state, m.name, m.latency_ms, m.device_id
                 FROM measurements AS m
                 JOIN (
                     SELECT ip, MAX(captured_at) AS latest
-                    FROM measurements WHERE is_demo = FALSE
+                    FROM measurements WHERE is_demo = FALSE AND {NET_FILTER_SQL}
                     GROUP BY ip
                 ) AS latest_scan ON latest_scan.ip = m.ip AND latest_scan.latest = m.captured_at
-                WHERE m.is_demo = FALSE
-                """
+                WHERE m.is_demo = FALSE AND m.{NET_FILTER_SQL}
+                """,
+                (network_id, network_id),
             ).fetchall()
             previous = {row["ip"]: row for row in rows}
             events = []
@@ -765,7 +1091,7 @@ def registrar_eventos_escaneo(dispositivos, cidr=None):
                     description = None
                     old_state = None
                 if event_type:
-                    events.append((now, ip, device.nombre or (old["name"] if old else None), event_type, old_state, device.estado, description, old["device_id"] if old else None))
+                    events.append((now, ip, device.nombre or (old["name"] if old else None), event_type, old_state, device.estado, description, old["device_id"] if old else None, network_id))
                 if (
                     device.estado == "activo"
                     and device.tiempo_respuesta >= settings["umbral_latencia_ms"]
@@ -775,7 +1101,7 @@ def registrar_eventos_escaneo(dispositivos, cidr=None):
                         now, ip, device.nombre or (old["name"] if old else None),
                         "latencia_elevada", old["state"] if old else None, device.estado,
                         f"Una medición registró {device.tiempo_respuesta:.1f} ms; confirma si se repite en escaneos posteriores.",
-                        old["device_id"] if old else None,
+                        old["device_id"] if old else None, network_id,
                     ))
 
             missing = set(previous) - set(current)
@@ -784,17 +1110,17 @@ def registrar_eventos_escaneo(dispositivos, cidr=None):
                 if old["state"] == "inactivo":
                     continue
                 if settings["alertar_dispositivo_ausente"]:
-                    events.append((now, ip, old["name"], "dispositivo_ausente", old["state"], "inactivo", "El dispositivo ya no aparece en el escaneo de red.", old["device_id"]))
+                    events.append((now, ip, old["name"], "dispositivo_ausente", old["state"], "inactivo", "El dispositivo ya no aparece en el escaneo de red.", old["device_id"], network_id))
                 missing_measurements.append((tombstone_scan_id, now, ip, None, "inactivo", old["name"], None, None, None, None, None, old["device_id"]))
 
             if missing_measurements:
                 insert_tombstone_run = (
-                    "INSERT INTO scan_runs(scan_id, captured_at, is_complete, is_demo) VALUES (?, ?, FALSE, FALSE) "
+                    "INSERT INTO scan_runs(scan_id, captured_at, network_id, is_complete, is_demo) VALUES (?, ?, ?, FALSE, FALSE) "
                     "ON CONFLICT(scan_id) DO NOTHING"
                     if DATABASE_URL
-                    else "INSERT OR IGNORE INTO scan_runs(scan_id, captured_at, is_complete, is_demo) VALUES (?, ?, 0, 0)"
+                    else "INSERT OR IGNORE INTO scan_runs(scan_id, captured_at, network_id, is_complete, is_demo) VALUES (?, ?, ?, 0, 0)"
                 )
-                connection.execute(insert_tombstone_run, (tombstone_scan_id, now))
+                connection.execute(insert_tombstone_run, (tombstone_scan_id, now, network_id))
                 connection.executemany(
                     """INSERT INTO measurements(
                         scan_id, captured_at, ip, latency_ms, state, name,
@@ -804,8 +1130,8 @@ def registrar_eventos_escaneo(dispositivos, cidr=None):
                 )
             connection.executemany(
                 """
-                INSERT INTO events(occurred_at, ip, device_name, event_type, previous_state, current_state, description, device_id, is_demo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+                INSERT INTO events(occurred_at, ip, device_name, event_type, previous_state, current_state, description, device_id, network_id, is_demo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
                 """,
                 events,
             )
@@ -883,18 +1209,20 @@ def _severidad_evento(event_type, current_state):
     return "informativa"
 
 
-def obtener_alertas(limite=30):
+def obtener_alertas(limite=30, network_id=None):
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         total = connection.execute(
-            "SELECT COUNT(*) AS count FROM events WHERE acknowledged_at IS NULL AND is_demo = FALSE"
+            f"SELECT COUNT(*) AS count FROM events WHERE acknowledged_at IS NULL AND is_demo = FALSE{filtro}",
+            parametros,
         ).fetchone()["count"]
         rows = connection.execute(
-            """SELECT id, occurred_at, ip, device_name, event_type, current_state,
+            f"""SELECT id, occurred_at, ip, device_name, event_type, current_state,
                       description, acknowledged_at
-               FROM events WHERE acknowledged_at IS NULL AND is_demo = FALSE
+               FROM events WHERE acknowledged_at IS NULL AND is_demo = FALSE{filtro}
                ORDER BY occurred_at DESC LIMIT ?""",
-            (limite,),
+            (*parametros, limite),
         ).fetchall()
     finally:
         connection.close()
@@ -939,13 +1267,14 @@ def _reparar_mojibake(value):
     return repaired if repaired != value else value
 
 
-def obtener_eventos(limite=50):
+def obtener_eventos(limite=50, network_id=None):
+    filtro, parametros = _filtro_red(network_id)
     connection = _connect()
     try:
         rows = connection.execute(
             "SELECT occurred_at, ip, device_name, event_type, previous_state, current_state, description "
-            "FROM events WHERE is_demo = FALSE ORDER BY occurred_at DESC LIMIT ?",
-            (limite,),
+            f"FROM events WHERE is_demo = FALSE{filtro} ORDER BY occurred_at DESC LIMIT ?",
+            (*parametros, limite),
         ).fetchall()
     finally:
         connection.close()
@@ -966,51 +1295,57 @@ def obtener_eventos(limite=50):
     }
 
 
-def obtener_datos_informe(dias=7):
+def obtener_datos_informe(dias=7, network_id=None):
     """Return inventory snapshot plus measurements and events for a report."""
     since = time.time() - dias * 24 * 60 * 60
+    if network_id is not None:
+        por_medicion, parametros = f" AND {NET_FILTER_SQL}", (network_id,)
+    else:
+        por_medicion, parametros = "", ()
+    por_red, _ = _filtro_red(network_id)
     connection = _connect()
     try:
         snapshot_rows = connection.execute(
-            """
+            f"""
             SELECT m.ip, m.latency_ms, m.state, m.name, m.manufacturer,
                    m.manufacturer_network, m.model, m.device_type, m.mac, m.captured_at,
                    d.owner, d.notes
             FROM measurements AS m
-            LEFT JOIN devices AS d ON d.id = (
+            LEFT JOIN devices AS d ON d.id = COALESCE(m.device_id, (
                 SELECT id FROM devices AS current_device
                 WHERE current_device.ip = m.ip AND current_device.is_demo = FALSE
                 ORDER BY current_device.last_seen DESC LIMIT 1
-            )
+            ))
             JOIN (
                 SELECT ip, MAX(captured_at) AS latest
-                FROM measurements WHERE is_demo = FALSE GROUP BY ip
+                FROM measurements WHERE is_demo = FALSE{por_medicion} GROUP BY ip
             ) AS latest ON latest.ip = m.ip AND latest.latest = m.captured_at
-            WHERE m.is_demo = FALSE
+            WHERE m.is_demo = FALSE{por_medicion.replace(" AND ", " AND m.", 1)}
             ORDER BY m.ip
-            """
+            """,
+            parametros * 2,
         ).fetchall()
         measurement_rows = connection.execute(
-            """
+            f"""
             SELECT scan_id, captured_at, ip, latency_ms, state, name, manufacturer,
                    manufacturer_network, model, device_type, mac
-            FROM measurements WHERE captured_at >= ? AND is_demo = FALSE
+            FROM measurements WHERE captured_at >= ? AND is_demo = FALSE{por_medicion}
             ORDER BY captured_at DESC
             """,
-            (since,),
+            (since, *parametros),
         ).fetchall()
         run_rows = connection.execute(
-            "SELECT scan_id FROM scan_runs WHERE captured_at >= ? AND is_demo = FALSE AND is_complete = TRUE",
-            (since,),
+            f"SELECT scan_id FROM scan_runs WHERE captured_at >= ? AND is_demo = FALSE AND is_complete = TRUE{por_red}",
+            (since, *parametros),
         ).fetchall()
         event_rows = connection.execute(
-            """
+            f"""
             SELECT occurred_at, ip, device_name, event_type, previous_state,
                    current_state, description
-            FROM events WHERE occurred_at >= ? AND is_demo = FALSE
+            FROM events WHERE occurred_at >= ? AND is_demo = FALSE{por_red}
             ORDER BY occurred_at DESC
             """,
-            (since,),
+            (since, *parametros),
         ).fetchall()
         trusted_rows = connection.execute("SELECT ip, mac FROM trusted_devices WHERE is_demo = FALSE").fetchall()
     finally:
@@ -1037,7 +1372,8 @@ def obtener_datos_informe(dias=7):
     scan_ids = {row["scan_id"] for row in run_rows}
     stats = {}
     for row in measurement_rows:
-        entry = stats.setdefault(row["ip"], {"con_respuesta": set(), "latencias": []})
+        entry = stats.setdefault(row["ip"], {"escaneos": set(), "con_respuesta": set(), "latencias": []})
+        entry["escaneos"].add(row["scan_id"])
         if row["state"] == "activo":
             entry["con_respuesta"].add(row["scan_id"])
         if row["latency_ms"] is not None:
@@ -1049,30 +1385,41 @@ def obtener_datos_informe(dias=7):
         if latest is None or row["captured_at"] > latest["captured_at"]:
             latest_by_ip[row["ip"]] = row
 
+    summary_devices = []
+    for ip, latest in latest_by_ip.items():
+        summary_devices.append({
+            "ip": ip, "mac": latest["mac"], "nombre": latest["name"],
+            "fabricante": latest["manufacturer"], "modelo": latest["model"],
+            "latest": latest,
+        })
+
     summaries = []
-    for ip, latest in sorted(latest_by_ip.items()):
-        entry = stats.get(ip, {"con_respuesta": set(), "latencias": []})
-        responded = len(entry["con_respuesta"])
-        latencies = entry["latencias"]
+    for group in _group_device_identities(summary_devices):
+        latest_device = max(group, key=lambda device: device["latest"]["captured_at"])
+        latest = latest_device["latest"]
+        ips = sorted({device["ip"] for device in group})
+        group_stats = [stats[ip] for ip in ips if ip in stats]
+        observed_scans = set().union(*(entry["escaneos"] for entry in group_stats)) if group_stats else set()
+        responding_scans = set().union(*(entry["con_respuesta"] for entry in group_stats)) if group_stats else set()
+        latencies = [latency for entry in group_stats for latency in entry["latencias"]]
+        responded = len(responding_scans)
+        total_observed = len(observed_scans)
         summaries.append({
-            "ip": ip,
-            "responsable": latest["owner"],
-            "notas": latest["notes"],
-            "mac": latest["mac"],
-            "nombre": latest["name"],
-            "fabricante": latest["manufacturer"],
-            "fabricante_red": latest["manufacturer_network"],
-            "modelo": latest["model"],
-            "tipo": latest["device_type"],
+            "ip": latest["ip"], "ips": ips,
+            "responsable": latest["owner"], "notas": latest["notes"],
+            "mac": latest["mac"], "nombre": latest["name"],
+            "fabricante": latest["manufacturer"], "fabricante_red": latest["manufacturer_network"],
+            "modelo": latest["model"], "tipo": latest["device_type"],
             "estado_actual": latest["state"],
-            "confianza": trust_state(ip, latest["mac"]),
+            "confianza": trust_state(latest["ip"], latest["mac"]),
             "escaneos_con_respuesta": responded,
-            "escaneos_registrados": len(scan_ids),
-            "disponibilidad_pct": round(responded * 100 / len(scan_ids), 2) if scan_ids else None,
+            "escaneos_registrados": total_observed,
+            "disponibilidad_pct": round(responded * 100 / total_observed, 2) if total_observed else None,
             "latencia_media_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
             "latencia_minima_ms": round(min(latencies), 2) if latencies else None,
             "latencia_maxima_ms": round(max(latencies), 2) if latencies else None,
         })
+    summaries.sort(key=lambda item: (item["nombre"] or "", item["ip"]))
 
     return {
         "dias": dias,
@@ -1150,4 +1497,69 @@ def obtener_historial(ip, limite=30):
         "total": len(measurements),
         "dias_retencion": RETENTION_DAYS,
         "mediciones": measurements,
+    }
+
+
+def obtener_historial_equipo(ips, limite=30, network_id=None):
+    ips = list(dict.fromkeys(ips))
+    if not ips:
+        return {"ips": [], "total": 0, "dias_retencion": RETENTION_DAYS, "mediciones": []}
+    placeholders = ", ".join("?" for _ in ips)
+    filtro, parametros = (f" AND {NET_FILTER_SQL}", (network_id,)) if network_id is not None else ("", ())
+    connection = _connect()
+    try:
+        rows = connection.execute(
+            f"""SELECT captured_at, ip, latency_ms, state, name, manufacturer,
+                       manufacturer_network, model, device_type
+                FROM measurements
+                WHERE ip IN ({placeholders}) AND is_demo = FALSE{filtro}
+                ORDER BY captured_at DESC, id DESC
+                LIMIT ?""",
+            (*ips, *parametros, limite),
+        ).fetchall()
+    finally:
+        connection.close()
+    measurements = [
+        {
+            "fecha": datetime.fromtimestamp(row["captured_at"], timezone.utc).isoformat(),
+            "ip": row["ip"], "latencia_ms": row["latency_ms"], "estado": row["state"],
+            "nombre": row["name"], "fabricante": row["manufacturer"],
+            "fabricante_red": row["manufacturer_network"], "modelo": row["model"],
+            "tipo": row["device_type"],
+        }
+        for row in reversed(rows)
+    ]
+    return {
+        "ips": ips, "total": len(measurements),
+        "dias_retencion": RETENTION_DAYS, "mediciones": measurements,
+    }
+
+
+def obtener_datos_analisis(dias=7, puntos_por_ip=30, network_id=None):
+    """Return per-IP measurement series and the trust list for the AI analysis."""
+    since = time.time() - dias * 24 * 60 * 60
+    filtro, parametros = (f" AND m.{NET_FILTER_SQL}", (network_id,)) if network_id is not None else ("", ())
+    connection = _connect()
+    try:
+        rows = connection.execute(
+            f"""SELECT m.ip, m.captured_at, m.state, m.latency_ms, m.mac
+               FROM measurements AS m
+               WHERE m.captured_at >= ? AND m.is_demo = FALSE{filtro}
+               ORDER BY m.captured_at, m.id""",
+            (since, *parametros),
+        ).fetchall()
+        trusted_rows = connection.execute(
+            "SELECT ip, mac FROM trusted_devices WHERE is_demo = FALSE"
+        ).fetchall()
+    finally:
+        connection.close()
+    series = {}
+    for row in rows:
+        series.setdefault(row["ip"], []).append({
+            "estado": row["state"], "latencia_ms": row["latency_ms"], "mac": row["mac"],
+        })
+    return {
+        "series": {ip: points[-puntos_por_ip:] for ip, points in series.items()},
+        "ips_confiables": [row["ip"] for row in trusted_rows],
+        "macs_confiables": [row["mac"] for row in trusted_rows if row["mac"]],
     }

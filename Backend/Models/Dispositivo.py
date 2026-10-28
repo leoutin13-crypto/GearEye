@@ -17,6 +17,9 @@ class Dispositivo(BaseModel):
     confianza: str = "por_revisar"
     responsable: Optional[str] = None
     notas: Optional[str] = None
+    sistema: Optional[str] = None
+    puertos: list[int] = Field(default_factory=list, max_length=64)
+    ttl: Optional[int] = Field(default=None, ge=0, le=255)
 
     @field_validator("ip")
     @classmethod
@@ -50,3 +53,10 @@ class ListaDispositivos(BaseModel):
     puerta_enlace: Optional[str] = None
     ip_local: Optional[str] = None
     subred: Optional[str] = None
+    adaptador_red: Optional[str] = None
+    descripcion_adaptador: Optional[str] = None
+    tipo_conexion: Optional[str] = None
+    topologia: Optional[dict] = None
+    red: Optional[dict] = None
+    red_actual: Optional[dict] = None
+    en_vivo: bool = True

@@ -3,9 +3,14 @@
 CREATE TABLE IF NOT EXISTS networks (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    cidr TEXT NOT NULL UNIQUE,
+    cidr TEXT NOT NULL,
     gateway TEXT,
+    gateway_mac TEXT,
+    gateway_vendor TEXT,
+    alias TEXT,
+    network_key TEXT,
     created_at DOUBLE PRECISION NOT NULL,
+    last_seen_at DOUBLE PRECISION,
     is_demo BOOLEAN NOT NULL DEFAULT FALSE,
     monitor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     monitor_interval_minutes INTEGER NOT NULL DEFAULT 5,
@@ -29,6 +34,8 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen DOUBLE PRECISION NOT NULL,
     owner TEXT,
     notes TEXT,
+    os_guess TEXT,
+    open_ports TEXT,
     is_demo BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE(network_id, ip)
 );
@@ -69,6 +76,7 @@ CREATE TABLE IF NOT EXISTS events (
     description TEXT NOT NULL,
     acknowledged_at DOUBLE PRECISION,
     device_id BIGINT REFERENCES devices(id),
+    network_id BIGINT REFERENCES networks(id),
     is_demo BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -98,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_measurements_ip_time ON measurements(ip, captured
 CREATE INDEX IF NOT EXISTS idx_measurements_device_time ON measurements(device_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_time ON events(occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_devices_network_ip ON devices(network_id, ip);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_networks_key ON networks(network_key);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_device_performance AS
 SELECT m.ip,

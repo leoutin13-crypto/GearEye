@@ -1,5 +1,5 @@
 const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:8000" : window.location.origin;
-const state = { devices: [], knownDevices: [], inventoryMode: "actual", selectedIp: null, lastScan: null, gateway: null, localIp: null, subnet: null, performance: [], performanceScans: 0, alerts: [], alertTotal: 0, profileRole: null };
+const state = { devices: [], knownDevices: [], inventoryMode: "actual", selectedIp: null, lastScan: null, gateway: null, localIp: null, subnet: null, topology: null, performance: [], performanceScans: 0, alerts: [], alertTotal: 0, profileRole: null, network: null, currentNetwork: null, liveView: true, networks: [] };
 const IDLE_TIMEOUT = 5 * 60 * 1000;
 let idleTimer = null;
 let warningTimer = null;
@@ -13,6 +13,10 @@ let monitorEnabled = false;
 let monitorBusy = false;
 let monitorNextAt = null;
 let operationalSettingsLoaded = false;
+let settingsNetworkId = null;
+// Las consultas se hacen sobre la red que se está viendo, no sobre todas las guardadas.
+const currentNetworkId = () => String(state.network?.id || viewedNetwork() || "");
+const apiUrl = (path) => `${API_BASE}${withNetwork(path, currentNetworkId())}`;
 const $ = (selector) => document.querySelector(selector);
 const elements = {
   rows: $("#device-rows"), search: $("#search-input"), filter: $("#status-filter"),
@@ -66,10 +70,6 @@ function scheduleNavigationUpdate() {
 window.addEventListener("scroll", scheduleNavigationUpdate, { passive: true });
 window.addEventListener("resize", scheduleNavigationUpdate);
 scheduleNavigationUpdate();
-
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-}
 
 function showToast(message) {
   elements.toast.textContent = message;
@@ -186,10 +186,11 @@ async function checkAuth() {
       state.devices = [];
       state.performance = [];
       state.performanceScans = 0;
+      state.knownDevices = [];
+      state.topology = null;
       renderSummary();
       renderDevices();
-      state.knownDevices = [];
-      if (state.inventoryMode === "conocidos") renderDevices();
+      renderTopology();
       renderPerformance();
       $("#auth-gate").hidden = true;
       $("#session-expired").hidden = false;
@@ -211,7 +212,7 @@ async function checkAuth() {
       const greeting = $("#welcome-heading");
       if (greeting) greeting.textContent = `Bienvenido, ${result.name || result.username}`;
       const companyLabel = $("#company-label");
-      if (companyLabel) companyLabel.textContent = result.company || "MONITOREO LOCAL";
+      if (companyLabel) companyLabel.textContent = result.company || "Red local";
       if (state.isRemoteCompany) $(".subtitle").textContent = `Datos reportados desde la red de ${result.company || "tu empresa"} por GearEye Agent.`;
       const adminNav = $("#admin-nav");
       if (adminNav) {
@@ -249,9 +250,11 @@ async function logout(reason = "manual") {
     state.devices = [];
     state.performance = [];
     state.performanceScans = 0;
-    renderSummary();
     state.knownDevices = [];
+    state.topology = null;
+    renderSummary();
     renderDevices();
+    renderTopology();
     renderPerformance();
     if (reason === "manual") {
       $("#session-expired").hidden = true;
@@ -334,20 +337,13 @@ function setConnection(online, label) {
   $("#footer-api").textContent = window.location.host || "127.0.0.1:8000";
 }
 
-function deviceIcon(device) {
-  if (device.tipo === "router") return "⌁";
-  if (device.tipo === "impresora") return "▤";
-  if (device.tipo === "computador") return "▣";
-  return "◉";
-}
-
 function renderDevices() {
   const inventoryDevices = state.inventoryMode === "conocidos" ? state.knownDevices : state.devices;
   const query = elements.search.value.trim().toLowerCase();
   const status = elements.filter.value;
   const selectedType = $("#type-filter").value;
   const types = [...new Set(inventoryDevices.map((device) => device.tipo).filter(Boolean))].sort();
-  $("#type-filter").innerHTML = `<option value="todos">Todos</option>${types.map((type) => `<option value="${esc(type)}">${esc(type)}</option>`).join("")}`;
+  $("#type-filter").innerHTML = `<option value="todos">Todos</option>${types.map((type) => `<option value="${esc(type)}">${esc(typeLabel(type))}</option>`).join("")}`;
   $("#type-filter").value = types.includes(selectedType) ? selectedType : "todos";
   const type = $("#type-filter").value;
   const latency = $("#latency-filter").value;
@@ -361,13 +357,13 @@ function renderDevices() {
   } else {
     elements.rows.innerHTML = filtered.map((device) => `
       <tr data-ip="${esc(device.ip)}" tabindex="0" aria-label="Ver detalles de ${esc(device.ip)}">
-        <td><div class="device-cell"><span class="device-avatar ${esc(device.tipo)}">${deviceIcon(device)}</span><span class="device-name"><strong>${esc(device.nombre || "Dispositivo sin nombre")}</strong><span>${esc(device.modelo || device.mac || "Identificación no disponible")} · <span class="trust-label ${device.confianza === "confiable" ? "trusted" : "review"}">${device.confianza === "confiable" ? "Confiable" : "Por revisar"}</span>${device.responsable ? ` · ${esc(device.responsable)}` : ""}</span></span></div></td>
-        <td class="mono">${esc(device.ip)}</td>
+        <td><div class="device-cell"><span class="device-avatar ${esc(device.tipo)}">${deviceIcon(device)}</span><span class="device-name"><strong>${esc(displayName(device))}</strong><span>${esc(device.modelo || device.mac || "Identificación no disponible")} · <span class="trust-label ${device.confianza === "confiable" ? "trusted" : "review"}">${device.confianza === "confiable" ? "Confiable" : "Por revisar"}</span>${device.responsable ? ` · ${esc(device.responsable)}` : ""}</span></span></div></td>
+        <td class="mono">${esc((device.ips || [device.ip]).join(", "))}</td>
         <td><span class="manufacturer" title="${esc(device.fabricante || device.fabricante_red || "No identificado")}">${esc(device.fabricante || device.fabricante_red || "—")}</span></td>
-        <td><span class="type-chip">${esc(device.tipo || "desconocido")}</span></td>
+        <td><span class="type-chip">${esc(typeLabel(device.tipo))}</span></td>
         <td><span class="status ${esc(device.estado)}">${esc(device.estado)}</span></td>
         <td class="latency">${state.inventoryMode === "conocidos" ? formatSeenDate(device.ultima_deteccion) : device.estado === "activo" ? `${Number(device.tiempo_respuesta).toFixed(1)} ms` : "—"}</td>
-        <td><button class="row-action" aria-label="Ver detalle">›</button></td>
+        <td><button class="row-action" aria-label="Ver detalle"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></td>
       </tr>`).join("");
     elements.rows.querySelectorAll("tr[data-ip]").forEach((row) => {
       row.addEventListener("click", () => openDetails(row.dataset.ip));
@@ -416,7 +412,7 @@ function renderActivity() {
     const slow = Number(device.tiempo_respuesta) >= 150;
     const label = device.nombre || device.ip;
     const message = device.estado === "detectado" ? "Detectado sin respuesta al ping" : slow ? `Latencia elevada · ${Number(device.tiempo_respuesta).toFixed(0)} ms` : "Dispositivo activo en la red";
-    return `<div class="activity-item"><span class="activity-symbol ${slow ? "warn" : ""}">${device.estado === "detectado" ? "!" : slow ? "◷" : "✓"}</span><div class="activity-text"><strong>${esc(label)}</strong> · ${esc(message)}<span class="activity-time">${esc(device.ip)} · último escaneo</span></div></div>`;
+    return `<div class="activity-item"><span class="activity-symbol ${slow ? "warn" : ""}">${icon(device.estado === "detectado" || slow ? "alerta" : "ok")}</span><div class="activity-text"><strong>${esc(label)}</strong> · ${esc(message)}<span class="activity-time">${esc(device.ip)} · último escaneo</span></div></div>`;
   }).join("") : `<div class="activity-empty">Los eventos de red aparecerán aquí.</div>`;
 }
 
@@ -427,26 +423,53 @@ async function scanNetwork(background = false) {
   elements.scan.disabled = true;
   $("#scan-button-label").textContent = "Escaneando…";
   try {
-    const response = await fetch(`${API_BASE}/api/dispositivos`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    const response = await fetch(`${API_BASE}${withNetwork("/api/dispositivos", viewedNetwork())}`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401) { await checkAuth(); return; }
+    if (response.status === 404 && viewedNetwork()) {
+      setViewedNetwork("");
+      showToast("La red elegida ya no está guardada. Se muestra la red conectada.");
+      setTimeout(() => scanNetwork(background), 0);
+      return;
+    }
     if (!response.ok) throw new Error(payload.detail || `La API respondi\u00f3 ${response.status}`);
     state.devices = Array.isArray(payload.dispositivos) ? payload.dispositivos : [];
     if (state.inventoryMode === "conocidos") renderDevices();
     state.gateway = payload.puerta_enlace || null;
     state.localIp = payload.ip_local || null;
     state.subnet = payload.subred || null;
+    state.topology = payload.topologia || null;
+    state.network = payload.red || null;
+    state.currentNetwork = payload.red_actual || payload.red || null;
+    state.liveView = payload.en_vivo !== false;
+    const savedView = isSavedView();
+    const networkCaption = $("#network-caption");
+    if (networkCaption) {
+      if (state.isRemoteCompany) {
+        networkCaption.textContent = `Inventario recibido del agente de red${state.subnet ? ` · ${state.subnet}` : ""}.`;
+      } else {
+        const adapter = payload.adaptador_red || payload.descripcion_adaptador || "adaptador activo";
+        const connection = payload.tipo_conexion || "red cableada/virtual";
+        networkCaption.textContent = `Escaneando ${connection} · ${adapter}${state.subnet ? ` · ${state.subnet}` : ""}${state.localIp ? ` · IP local ${state.localIp}` : ""}.`;
+      }
+      if (savedView) networkCaption.textContent = "Datos del último escaneo guardado de esta red. GearEye sigue vigilando la red a la que estás conectado.";
+    }
     state.lastScan = new Date();
     setConnection(true, "API conectada");
     renderSummary();
     renderDevices();
     renderTopology();
+    renderNetworkBar();
+    if (settingsNetworkId !== currentNetworkId()) await loadOperationalSettings();
     await loadStorageStatus(background);
     await loadKnownDevices(background);
     await loadEvents(background);
     await loadAlerts(background);
+    await loadAnalysis(background);
     await loadPerformance(background);
-    if (!background) showToast(state.isRemoteCompany ? `Inventario actualizado: ${state.devices.length} dispositivos.` : `Escaneo completado: ${state.devices.length} dispositivos detectados.`);
+    await loadNetworks();
+    if (!background && savedView) showToast(`Mostrando ${state.network.nombre}: ${state.devices.length} equipos guardados.`);
+    else if (!background) showToast(state.isRemoteCompany ? `Inventario actualizado: ${state.devices.length} dispositivos.` : `Escaneo completado: ${state.devices.length} dispositivos detectados.`);
   } catch (error) {
     setConnection(false, "API no disponible");
     showToast(error.message.includes("Failed to fetch") ? "No se pudo conectar. Abre GearEye desde http://127.0.0.1:8000/app." : error.message);
@@ -461,7 +484,7 @@ async function scanNetwork(background = false) {
 
 async function loadKnownDevices(background = false) {
   try {
-    const response = await fetch(`${API_BASE}/api/inventario`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    const response = await fetch(apiUrl(`/api/inventario`), { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401) { await checkAuth(); return; }
     if (!response.ok) throw new Error(payload.detail || `La API respondió ${response.status}`);
@@ -488,27 +511,75 @@ async function loadStorageStatus(background = false) {
 }
 
 function renderTopology() {
+  const topology = state.topology || {};
+  const links = Array.isArray(topology.links) ? topology.links : [];
+  const physical = links.length > 0;
+  const physicalCanvas = $("#physical-topology");
+  const logicalCanvas = $("#topology-logical");
+  const note = $("#topology-note");
+  physicalCanvas.hidden = !physical;
+  logicalCanvas.hidden = physical;
+  $("#topology-subnet").textContent = `${state.subnet || "Subred no disponible"}${state.localIp ? ` · IP local ${state.localIp}` : ""}`;
+
+  if (physical) {
+    const groups = new Map();
+    for (const link of links) {
+      const key = link.switch_ip || link.switch_name || "switch-desconocido";
+      if (!groups.has(key)) groups.set(key, { ip: link.switch_ip || "IP no informada", name: link.switch_name || "Switch LLDP", links: [] });
+      groups.get(key).links.push(link);
+    }
+    const switches = Array.isArray(topology.switches) ? topology.switches : [...groups.values()];
+    const knownSwitches = switches.length ? switches : [...groups.values()];
+    physicalCanvas.innerHTML = `<div class="physical-topology-grid">${knownSwitches.map((switchInfo) => {
+      const switchLinks = switchInfo.links || groups.get(switchInfo.ip)?.links || [];
+      return `<article class="physical-switch"><header class="physical-switch-heading"><span class="physical-switch-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h2m3 0h2m3 0h1M7 15h10"/></svg></span><span class="physical-switch-copy"><strong>${esc(switchInfo.name || "Switch administrable")}</strong><span>${esc(switchInfo.ip || "IP no informada")}</span></span><span class="physical-port-count">${switchLinks.length} ${switchLinks.length === 1 ? "enlace" : "enlaces"}</span></header><div class="physical-links">${switchLinks.map((link) => {
+        const remoteDevice = state.devices.find((device) => device.ip === link.remote_ip);
+        const remoteName = link.remote_name || remoteDevice?.nombre || "Vecino LLDP";
+        const remoteAddress = link.remote_ip || link.remote_mac || "Identidad no publicada";
+        const neighbor = `<span class="physical-neighbor-copy"><strong>${esc(remoteName)}</strong><span>${esc(remoteAddress)}</span><small>${link.remote_port ? `Puerto remoto ${esc(link.remote_port)}` : "Puerto remoto no informado"} · ${esc(link.protocol || "LLDP")}</small></span>`;
+        return `<div class="physical-link"><span class="physical-port">${esc(link.local_port || "Puerto sin nombre")}</span><span class="physical-cable" aria-hidden="true"></span>${remoteDevice ? `<button class="physical-neighbor" type="button" data-physical-ip="${esc(remoteDevice.ip)}"><span class="physical-neighbor-icon" aria-hidden="true">${deviceIcon(remoteDevice)}</span>${neighbor}</button>` : `<div class="physical-neighbor physical-neighbor-unresolved"><span class="physical-neighbor-icon" aria-hidden="true">${icon("desconocido")}</span>${neighbor}</div>`}</div>`;
+      }).join("") || '<div class="topology-empty">El switch respondió por SNMP, pero no reportó vecinos LLDP.</div>'}</div></article>`;
+    }).join("")}</div>`;
+    physicalCanvas.querySelectorAll("[data-physical-ip]").forEach((button) => button.addEventListener("click", () => openDetails(button.dataset.physicalIp)));
+    $("#topology-total").textContent = `${knownSwitches.length} ${knownSwitches.length === 1 ? "switch" : "switches"} · ${links.length} ${links.length === 1 ? "enlace" : "enlaces"}`;
+    $("#topology-caption").textContent = "Conexiones físicas informadas por los switches mediante LLDP.";
+    note.innerHTML = `<span>${icon("info")}</span><span>Los puertos y vecinos mostrados vienen de LLDP. Los vecinos sin IP visible se identifican con el nombre o la MAC que publicó el switch.</span>`;
+    return;
+  }
+
   const router = state.devices.find((device) => device.ip === state.gateway || device.tipo === "router");
   const gatewayIp = state.gateway || router?.ip || null;
   const gateway = $("#gateway-node");
   const gatewayState = router?.estado || "sin-respuesta";
   const gatewayName = router?.nombre || (gatewayIp ? "Puerta de enlace" : "Gateway no identificado");
   gateway.className = `topology-node topology-gateway ${router ? `state-${router.estado}` : "state-unknown"}`;
-  gateway.innerHTML = `<span class="topology-node-icon">?</span><span class="topology-node-copy"><strong>${esc(gatewayName)}</strong><span>${esc(gatewayIp || "IP no disponible")}</span></span><span class="topology-node-state">${router ? esc(router.estado) : "Sin respuesta"}</span>`;
+  gateway.innerHTML = `<span class="topology-node-icon">${icon("router")}</span><span class="topology-node-copy"><strong>${esc(gatewayName)}</strong><span>${esc(gatewayIp || "IP no disponible")}</span></span><span class="topology-node-state">${router ? esc(router.estado) : "Sin respuesta"}</span>`;
   gateway.disabled = !router;
   gateway.onclick = () => router && openDetails(router.ip);
 
   const nodes = state.devices.filter((device) => device.ip !== gatewayIp);
   const container = $("#topology-nodes");
-  $("#topology-subnet").textContent = `${state.subnet || "Subred no disponible"}${state.localIp ? ` ? Equipo local ${state.localIp}` : ""}`;
-  $("#topology-total").textContent = `${nodes.length + 1} nodos`;
+  $("#topology-total").textContent = `${nodes.length + (gatewayIp ? 1 : 0)} nodos`;
   container.innerHTML = nodes.length ? nodes.map((device) => `
     <button class="topology-node topology-device state-${esc(device.estado)}" type="button" data-topology-ip="${esc(device.ip)}" aria-label="Ver detalles de ${esc(device.nombre || device.ip)}">
-      <span class="topology-node-icon">${device.tipo === "computador" ? "?" : device.tipo === "impresora" ? "?" : "?"}</span>
-      <span class="topology-node-copy"><strong>${esc(device.nombre || device.tipo || "Dispositivo")}</strong><span>${esc(device.ip)} ? ${esc(device.fabricante || device.fabricante_red || "Fabricante desconocido")}</span></span>
+      <span class="topology-node-icon">${deviceIcon(device)}</span>
+      <span class="topology-node-copy"><strong title="${esc(displayName(device))}">${esc(displayName(device))}</strong><span>${esc(device.ip)} · ${esc(device.fabricante || device.fabricante_red || "Fabricante desconocido")}</span></span>
       <span class="topology-node-state">${esc(device.estado)}</span>
     </button>`).join("") : '<div class="topology-empty">Ejecuta un escaneo para mostrar los dispositivos de esta red.</div>';
   container.querySelectorAll("[data-topology-ip]").forEach((button) => button.addEventListener("click", () => openDetails(button.dataset.topologyIp)));
+  const reasonText = {
+    snmp_not_configured: "Para ver puertos físicos, configura SNMP de solo lectura en el agente de la LAN y habilita LLDP en los switches. Sin LLDP, GearEye muestra solo la vista lógica.",
+    snmp_credentials_incomplete: "Faltan credenciales SNMPv3 en el agente de la LAN; configura un usuario de solo lectura para consultar LLDP.",
+    snmp_credentials_invalid_length: "Las claves SNMPv3 deben tener entre 8 y 32 bytes.",
+    snmp_version_unsupported: "La versión SNMP configurada no es compatible. Usa SNMPv1, v2c o v3.",
+    pysnmp_not_installed: "Instala las dependencias de GearEye en el equipo del agente para habilitar la consulta SNMP.",
+    switch_not_found: "No se detectó automáticamente un switch gestionable. Agrega su IP de administración en GEAREYE_SNMP_TARGETS en el agente de la LAN.",
+    snmp_unreachable: "No hubo respuesta SNMP de los switches configurados. Revisa la IP de administración, UDP 161 y las credenciales de solo lectura.",
+    no_lldp_neighbors: "El equipo respondió por SNMP, pero no reportó vecinos LLDP. Habilita LLDP en los puertos del switch.",
+    snmp_scan_unavailable: "La consulta SNMP no pudo iniciarse. Ejecuta el agente en un proceso de GearEye y vuelve a escanear.",
+  };
+  $("#topology-caption").textContent = "Vista lógica de los equipos detectados; los puertos físicos aparecen cuando un switch reporta vecinos LLDP.";
+  note.innerHTML = `<span>${icon("info")}</span><span>${esc(reasonText[topology.reason] || "Las líneas muestran una referencia lógica desde el gateway; los enlaces físicos requieren datos LLDP del switch.")}</span>`;
   requestAnimationFrame(drawTopologyLinks);
 }
 
@@ -561,8 +632,9 @@ function scheduleMonitor() {
 }
 
 async function loadOperationalSettings() {
+  settingsNetworkId = currentNetworkId();
   try {
-    const response = await fetch(`${API_BASE}/api/configuracion/monitoreo`, { credentials: "same-origin", headers: { Accept: "application/json" } });
+    const response = await fetch(apiUrl(`/api/configuracion/monitoreo`), { credentials: "same-origin", headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error("No se pudo cargar la configuración operativa.");
     const config = await response.json();
     $("#scan-interval").value = String(config.intervalo_minutos);
@@ -588,7 +660,7 @@ async function saveOperationalSettings(showConfirmation = true) {
     alertar_dispositivo_ausente: $("#alert-offline-devices").checked,
   };
   try {
-    const response = await fetch(`${API_BASE}/api/configuracion/monitoreo`, {
+    const response = await fetch(apiUrl(`/api/configuracion/monitoreo`), {
       method: "PUT", credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(payload),
@@ -605,7 +677,7 @@ async function saveOperationalSettings(showConfirmation = true) {
 async function exportEvents() {
   const days = Number($("#events-period").value);
   try {
-    const response = await fetch(`${API_BASE}/api/eventos.csv?dias=${days}`, { credentials: "same-origin" });
+    const response = await fetch(apiUrl(`/api/eventos.csv?dias=${days}`), { credentials: "same-origin" });
     if (response.status === 401) { await checkAuth(); return; }
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -624,17 +696,17 @@ async function exportEvents() {
 
 async function loadEvents(background = false) {
   try {
-    const response = await fetch(`${API_BASE}/api/eventos?limite=30`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    const response = await fetch(apiUrl(`/api/eventos?limite=30`), { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
     if (response.status === 401) { await checkAuth(); return; }
     if (!response.ok) throw new Error("No se pudo consultar la bit\u00e1cora.");
     const payload = await response.json();
     const events = payload.eventos || [];
     $("#activity-list").innerHTML = events.length ? events.slice(0, 8).map((event) => {
-      const icon = event.tipo === "dispositivo_nuevo" ? "+" : event.estado_actual === "inactivo" ? "!" : "\u2194";
+      const symbol = icon(event.tipo === "dispositivo_nuevo" ? "nuevo" : event.estado_actual === "inactivo" ? "alerta" : "cambio");
       const tone = event.estado_actual === "inactivo" ? "warn" : "";
       const name = event.nombre || event.ip;
       const date = new Date(event.fecha).toLocaleString("es-CO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
-      return `<div class="activity-item"><span class="activity-symbol ${tone}">${icon}</span><div class="activity-text"><strong>${esc(name)}</strong> \u00b7 ${esc(event.mensaje)}<span class="activity-time">${esc(event.ip)} \u00b7 ${esc(date)}</span></div></div>`;
+      return `<div class="activity-item"><span class="activity-symbol ${tone}">${symbol}</span><div class="activity-text"><strong>${esc(name)}</strong> \u00b7 ${esc(event.mensaje)}<span class="activity-time">${esc(event.ip)} \u00b7 ${esc(date)}</span></div></div>`;
     }).join("") : '<div class="activity-empty">Sin cambios registrados. El primer escaneo de referencia no genera alertas.</div>';
   } catch (error) {
     $("#activity-list").innerHTML = `<div class="activity-empty">${esc(error.message)}</div>`;
@@ -643,7 +715,7 @@ async function loadEvents(background = false) {
 
 async function loadAlerts(background = false) {
   try {
-    const response = await fetch(`${API_BASE}/api/alertas?limite=30`, { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    const response = await fetch(apiUrl(`/api/alertas?limite=30`), { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
     if (response.status === 401) { await checkAuth(); return; }
     if (!response.ok) throw new Error("No se pudieron consultar las alertas.");
     const payload = await response.json();
@@ -664,7 +736,7 @@ function renderAlerts() {
     const date = new Date(alert.fecha).toLocaleString("es-CO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
     const title = alert.nombre || alert.ip;
     const label = alert.tipo === "latencia_elevada" ? "Latencia elevada" : alert.tipo === "dispositivo_nuevo" ? "Equipo nuevo" : alert.estado_actual === "inactivo" ? "Conectividad" : "Cambio de estado";
-    return `<article class="alert-item severity-${esc(alert.severidad)}"><span class="alert-mark">${alert.severidad === "critica" ? "!" : alert.severidad === "advertencia" ? "+" : "i"}</span><div class="alert-copy"><strong>${esc(title)}</strong><span>${esc(alert.mensaje)}</span><small>${esc(alert.ip)} · ${esc(date)} · ${label}</small></div><button class="alert-ack" type="button" data-ack-alert="${Number(alert.id)}">Reconocer</button></article>`;
+    return `<article class="alert-item severity-${esc(alert.severidad)}"><span class="alert-mark">${icon(alert.tipo === "dispositivo_nuevo" ? "nuevo" : alert.severidad === "informativa" ? "info" : "alerta")}</span><div class="alert-copy"><strong>${esc(title)}</strong><span>${esc(alert.mensaje)}</span><small>${esc(alert.ip)} · ${esc(date)} · ${label}</small></div><button class="alert-ack" type="button" data-ack-alert="${Number(alert.id)}">Reconocer</button></article>`;
   }).join("") : '<div class="alert-empty"><strong>Todo al día</strong><span>No hay cambios de red pendientes de revisión.</span></div>';
   $("#alert-list").querySelectorAll("[data-ack-alert]").forEach((button) => button.addEventListener("click", () => acknowledgeAlert(button.dataset.ackAlert)));
 }
@@ -677,6 +749,38 @@ async function acknowledgeAlert(id) {
     await loadAlerts();
     showToast("Alerta reconocida.");
   } catch (error) { showToast(error.message); }
+}
+
+const AI_LABELS = { critico: "Crítico", advertencia: "Advertencia", intrusion: "Intrusión", operativo: "Operativo" };
+
+async function loadAnalysis(background = false) {
+  try {
+    const response = await fetch(apiUrl(`/api/analisis-ia?dias=7`), { credentials: "same-origin", headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) } });
+    if (response.status === 401) { await checkAuth(); return; }
+    if (!response.ok) throw new Error("No se pudo consultar el análisis de IA.");
+    renderAnalysis(await response.json());
+  } catch (error) {
+    $("#ai-list").innerHTML = `<div class="alert-empty">${esc(error.message)}</div>`;
+  }
+}
+
+function renderAnalysis(payload) {
+  const findings = payload.hallazgos || [];
+  const summary = payload.resumen || {};
+  const relevant = findings.filter((item) => item.severidad !== "operativo").length;
+  $("#nav-ai").textContent = relevant > 99 ? "99+" : relevant;
+  $("#ai-health").textContent = summary.salud == null ? "Sin datos" : `Salud de la red ${summary.salud}%`;
+  $("#ai-health").classList.toggle("has-critical", findings.some((item) => item.severidad === "critico" || item.severidad === "intrusion"));
+  $("#ai-caption").textContent = summary.dispositivos_analizados
+    ? `${summary.dispositivos_analizados} equipos analizados · ${summary.con_linea_base || 0} con comportamiento normal aprendido (mínimo 5 escaneos).`
+    : "El análisis aparecerá después de varios escaneos.";
+  $("#ai-method").textContent = payload.metodo ? `Método: ${payload.metodo}` : "";
+  $("#ai-list").innerHTML = findings.length ? findings.map((item) => {
+    const severity = item.severidad === "critico" || item.severidad === "intrusion" ? "critica" : item.severidad === "advertencia" ? "advertencia" : "informativa";
+    const mark = icon(item.severidad === "intrusion" ? "escudo" : severity === "informativa" ? "info" : "alerta");
+    const target = item.ip ? `${esc(item.ip)} · ` : "";
+    return `<article class="alert-item ai-item severity-${severity}"><span class="alert-mark">${mark}</span><div class="alert-copy"><strong>${esc(item.titulo)}</strong><span>${esc(item.causa_probable)}</span><small><b class="severity-tag">${AI_LABELS[item.severidad] || esc(item.severidad)}</b>${target}${esc(item.recomendacion)}</small></div></article>`;
+  }).join("") : '<div class="alert-empty"><strong>Sin hallazgos</strong><span>La red se comporta como de costumbre.</span></div>';
 }
 
 function renderPerformance() {
@@ -711,23 +815,28 @@ function renderPerformance() {
     const barWidth = availability === null ? 0 : Math.max(0, Math.min(100, availability));
     const availabilityText = availability === null ? "—" : `${availability.toFixed(1)}%`;
     const latency = (value) => value === null || value === undefined ? "—" : `${Number(value).toFixed(1)} ms`;
-    const title = item.nombre || item.tipo || "Dispositivo";
+    const title = displayName(item);
     const detail = item.fabricante || item.fabricante_red || item.mac || item.ip;
-    return `<tr>
-      <td><div class="device-cell"><span class="device-avatar ${esc(item.tipo || "desconocido")}">${deviceIcon({ tipo: item.tipo })}</span><span class="device-name"><strong>${esc(title)}</strong><span>${esc(detail)} · ${esc(item.ip)}</span></span></div></td>
+    return `<tr data-performance-ip="${esc(item.ip)}" tabindex="0" aria-label="Ver historial de ${esc(title)}">
+      <td><div class="device-cell"><span class="device-avatar ${esc(item.tipo || "desconocido")}">${deviceIcon({ tipo: item.tipo })}</span><span class="device-name"><strong>${esc(title)}</strong><span>${esc(detail)} · ${esc((item.ips || [item.ip]).join(", "))}</span></span></div></td>
       <td><span class="status ${esc(item.estado_actual || "inactivo")}">${esc(item.estado_actual || "Sin datos")}</span></td>
       <td><div class="performance-availability"><strong>${availabilityText}</strong><span class="performance-meter"><i style="width:${barWidth}%"></i></span></div></td>
       <td>${Number(item.escaneos_con_respuesta || 0)} / ${Number(item.escaneos_registrados || 0)}</td>
       <td>${latency(item.latencia_media_ms)}</td><td>${latency(item.latencia_minima_ms)}</td><td>${latency(item.latencia_maxima_ms)}</td>
     </tr>`;
   }).join("");
+  $("#performance-rows").querySelectorAll("tr[data-performance-ip]").forEach((row) => {
+    const item = state.performance.find((entry) => entry.ip === row.dataset.performanceIp);
+    row.addEventListener("click", () => openDetails(row.dataset.performanceIp, item));
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter") openDetails(row.dataset.performanceIp, item); });
+  });
 }
 
 async function loadPerformance(background = false) {
   const days = $("#performance-period").value;
   $("#performance-rows").innerHTML = '<tr><td colspan="7"><div class="empty-state"><span class="loader"></span><strong>Consultando historial</strong><span>Un momento, por favor.</span></div></td></tr>';
   try {
-    const response = await fetch(`${API_BASE}/api/informes?dias=${encodeURIComponent(days)}`, {
+    const response = await fetch(apiUrl(`/api/informes?dias=${encodeURIComponent(days)}`), {
       credentials: "same-origin",
       headers: { Accept: "application/json", ...(background ? { "X-GearEye-Background": "true" } : {}) },
     });
@@ -744,10 +853,14 @@ async function loadPerformance(background = false) {
 }
 
 function detailFields(device) {
+  const ips = device.ips?.length ? device.ips : [device.ip];
+  const subnets = device.subredes?.length ? device.subredes : device.subred ? [device.subred] : [];
   return [
-    ["Dirección IP", device.ip], ["Dirección MAC", device.mac], ["Nombre de host", device.nombre],
+    [ips.length > 1 ? "Direcciones IP" : "Dirección IP", ips.join(", ")],
+    ...(subnets.length ? [[subnets.length > 1 ? "Subredes" : "Subred", subnets.join(", ")]] : []),
+    ["Dirección MAC", device.mac], ["Nombre de host", device.nombre],
     ["Fabricante", device.fabricante], ["Fabricante de red", device.fabricante_red], ["Modelo", device.modelo],
-    ["Tipo", device.tipo], ["Estado", device.estado], ["Inventario", device.confianza === "confiable" ? "Confiable" : "Por revisar"], ["Responsable", device.responsable], ["Latencia observada", device.estado === "activo" ? `${Number(device.tiempo_respuesta).toFixed(2)} ms` : "Sin respuesta al ping"],
+    ["Tipo", typeLabel(device.tipo)], ["Sistema estimado", device.sistema], ["Estado", capitalize(device.estado)], ["Inventario", device.confianza === "confiable" ? "Confiable" : "Por revisar"], ["Responsable", device.responsable], ["Servicios detectados", serviceList(device.puertos).join(", ")], ["Latencia observada", device.estado === "activo" ? `${Number(device.tiempo_respuesta).toFixed(2)} ms` : "Sin respuesta al ping"],
   ];
 }
 
@@ -765,7 +878,10 @@ async function loadHistory(ip) {
   chart.innerHTML = '<div class="history-empty"><span class="loader"></span> Consultando historial</div>';
   summary.innerHTML = "";
   try {
-    const response = await fetch(`${API_BASE}/api/historial/${encodeURIComponent(ip)}?limite=30`, {
+    const ips = Array.isArray(ip) ? ip : [ip];
+    const params = new URLSearchParams({ limite: "30" });
+    ips.forEach((address) => params.append("ip", address));
+    const response = await fetch(apiUrl(`/api/historial-equipo?${params}`), {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
     });
@@ -779,8 +895,8 @@ async function loadHistory(ip) {
     if (!points.length) {
       chart.innerHTML = `<div class="history-empty">${scans.length ? "Hay escaneos, pero este equipo no respondió al ping." : "Aún no hay mediciones guardadas. Ejecuta un escaneo de red para empezar."}</div>`;
       const latest = scans.at(-1);
-      const details = latest ? [latest.nombre, latest.fabricante || latest.fabricante_red, latest.modelo, latest.tipo].filter(Boolean).join(" ? ") : "";
-      summary.innerHTML = `${details ? `<span class="history-device-info">${esc(details)}</span>` : ""}<span class="history-retention">Se conserva durante ${payload.dias_retencion} d?as.</span>`;
+      const details = latest ? [latest.nombre, latest.fabricante || latest.fabricante_red, latest.modelo, typeLabel(latest.tipo)].filter(Boolean).join(" · ") : "";
+      summary.innerHTML = `${details ? `<span class="history-device-info">${esc(details)}</span>` : ""}<span class="history-retention">Se conserva durante ${payload.dias_retencion} días.</span>`;
       return;
     }
 
@@ -810,12 +926,12 @@ async function loadHistory(ip) {
     }).join("");
     const firstDate = esc(formatHistoryDate(points[0].fecha, true));
     const lastDate = esc(formatHistoryDate(points.at(-1).fecha, true));
-    chart.innerHTML = `<svg viewBox="0 0 640 165" role="img" aria-label="Historial de latencia para ${esc(ip)}">${grids}<path d="${area}" class="chart-area"/><path d="${line}" class="chart-line" pathLength="1000"/>${dots}<text x="${left}" y="156" class="chart-date">${firstDate}</text><text x="${right}" y="156" text-anchor="end" class="chart-date">${lastDate}</text></svg>`;
+    chart.innerHTML = `<svg viewBox="0 0 640 165" role="img" aria-label="Historial de latencia para ${esc(ips.join(", "))}">${grids}<path d="${area}" class="chart-area"/><path d="${line}" class="chart-line" pathLength="1000"/>${dots}<text x="${left}" y="156" class="chart-date">${firstDate}</text><text x="${right}" y="156" text-anchor="end" class="chart-date">${lastDate}</text></svg>`;
 
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
     const latest = scans.at(-1);
-    const details = latest ? [latest.nombre, latest.fabricante || latest.fabricante_red, latest.modelo, latest.tipo].filter(Boolean).join(" ? ") : "";
-    summary.innerHTML = `<div><span>Media</span><strong>${average.toFixed(1)} <small>ms</small></strong></div><div><span>M?nima</span><strong>${low.toFixed(1)} <small>ms</small></strong></div><div><span>M?xima</span><strong>${high.toFixed(1)} <small>ms</small></strong></div><span class="history-device-info">${esc(details || ip)}</span><span class="history-retention">Retenci?n: ${payload.dias_retencion} d?as</span>`;
+    const details = latest ? [latest.nombre, latest.fabricante || latest.fabricante_red, latest.modelo, typeLabel(latest.tipo)].filter(Boolean).join(" · ") : "";
+    summary.innerHTML = `<div><span>Media</span><strong>${average.toFixed(1)} <small>ms</small></strong></div><div><span>Mínima</span><strong>${low.toFixed(1)} <small>ms</small></strong></div><div><span>Máxima</span><strong>${high.toFixed(1)} <small>ms</small></strong></div><span class="history-device-info">${esc(details || ips.join(", "))}</span><span class="history-retention">Retención: ${payload.dias_retencion} días</span>`;
   } catch (error) {
     $("#history-count").textContent = "No disponible";
     chart.innerHTML = `<div class="history-empty">No se pudo cargar el historial: ${esc(error.message)}</div>`;
@@ -823,30 +939,41 @@ async function loadHistory(ip) {
 }
 
 async function loadDiagnostic(ip) {
+  if (!state.liveView && !state.isRemoteCompany) {
+    $("#diagnostic-content").textContent = "El diagnóstico en vivo solo funciona en la red a la que estás conectado.";
+    return;
+  }
   $("#diagnostic-content").textContent = "Consultando diagnóstico…";
   try {
     const response = await fetch(`${API_BASE}/api/diagnostico/${encodeURIComponent(ip)}`, { credentials: "same-origin", headers: { Accept: "application/json" } });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.detail || `La API respondió ${response.status}`);
     const d = payload.diagnostico;
-    $("#diagnostic-content").innerHTML = `<span class="diagnostic-level">${esc(d.nivel)}</span><p><strong>${esc(d.mensaje)}</strong></p><p>${esc(d.recomendacion)}</p><p>${esc(d.observaciones || "")}</p>`;
+    $("#diagnostic-content").innerHTML = `<span class="diagnostic-level level-${esc(d.nivel)}">${esc(capitalize(d.nivel))}</span><p><strong>${esc(d.mensaje)}</strong></p><p>${esc(d.recomendacion)}</p><p>${esc(d.observaciones || "")}</p>`;
   } catch (error) {
     $("#diagnostic-content").textContent = `No se pudo obtener el diagnóstico: ${error.message}`;
   }
 }
 
-function openDetails(ip) {
-  const device = state.devices.find((item) => item.ip === ip);
+function openDetails(ip, fallback = null) {
+  const inventory = [...state.knownDevices, ...state.devices];
+  const device = inventory.find((item) => item.ips?.length > 1 && item.ips.includes(ip))
+    || inventory.find((item) => item.ip === ip || item.ips?.includes(ip)) || (fallback ? {
+    ...fallback,
+    estado: fallback.estado_actual || "inactivo",
+    tiempo_respuesta: fallback.latencia_media_ms,
+  } : null);
   if (!device) return;
   state.selectedIp = ip;
-  $("#detail-title").textContent = device.nombre || device.ip;
+  state.selectedDevice = device;
+  $("#detail-title").textContent = displayName(device);
   $("#detail-status").innerHTML = `<span class="status ${esc(device.estado)}">${esc(device.estado)}</span>`;
   $("#detail-grid").innerHTML = detailFields(device).map(([label, value]) => `<div class="detail-item"><span>${esc(label)}</span><strong>${esc(value || "No disponible")}</strong></div>`).join("");
   renderTrustControl(device);
   loadDeviceNotes(ip);
   $("#advanced-results").textContent = "Estas comprobaciones solo se ejecutan cuando las solicitas.";
   elements.dialog.showModal();
-  loadHistory(ip);
+  loadHistory(device.ips?.length ? device.ips : [device.ip]);
   loadDiagnostic(ip);
 }
 
@@ -854,7 +981,7 @@ async function loadDeviceNotes(ip) {
   $("#device-owner").value = "";
   $("#device-notes").value = "";
   try {
-    const response = await fetch(`${API_BASE}/api/dispositivos/${encodeURIComponent(ip)}/notas`, { credentials: "same-origin", headers: { Accept: "application/json" } });
+    const response = await fetch(apiUrl(`/api/dispositivos/${encodeURIComponent(ip)}/notas`), { credentials: "same-origin", headers: { Accept: "application/json" } });
     if (!response.ok) return;
     const data = await response.json();
     if (state.selectedIp !== ip) return;
@@ -869,7 +996,7 @@ async function saveDeviceNotes() {
   const button = $("#save-device-notes");
   button.disabled = true;
   try {
-    const response = await fetch(`${API_BASE}/api/dispositivos/${encodeURIComponent(ip)}/notas`, {
+    const response = await fetch(apiUrl(`/api/dispositivos/${encodeURIComponent(ip)}/notas`), {
       method: "PUT", credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ responsable: $("#device-owner").value, notas: $("#device-notes").value }),
@@ -927,7 +1054,7 @@ async function updateTrust(ip, confiable) {
   const button = $("#trust-toggle");
   button.disabled = true;
   try {
-    const response = await fetch(`${API_BASE}/api/dispositivos/${encodeURIComponent(ip)}/confianza`, {
+    const response = await fetch(apiUrl(`/api/dispositivos/${encodeURIComponent(ip)}/confianza`), {
       method: "PUT", credentials: "same-origin", headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ confiable }),
     });
@@ -966,7 +1093,7 @@ async function downloadReport() {
   button.disabled = true;
   button.classList.add("loading");
   try {
-    const response = await fetch(`${API_BASE}/api/informes.csv?dias=${encodeURIComponent(days)}`, {
+    const response = await fetch(apiUrl(`/api/informes.csv?dias=${encodeURIComponent(days)}`), {
       credentials: "same-origin",
       headers: { Accept: "text/csv" },
     });
@@ -995,7 +1122,120 @@ async function downloadReport() {
   }
 }
 
-elements.scan.addEventListener("click", scanNetwork);
+function isSavedView() {
+  return Boolean(state.network && state.currentNetwork && state.network.id !== state.currentNetwork.id);
+}
+
+function renderNetworkBar() {
+  const red = state.network;
+  $("#network-bar").hidden = !red;
+  if (!red) return;
+  const saved = isSavedView();
+  document.body.classList.toggle("saved-network-view", saved);
+  $("#network-bar-icon").innerHTML = icon("router");
+  $("#network-name").textContent = red.nombre;
+  const status = $("#network-state");
+  status.className = `network-state ${saved ? "saved" : "live"}`;
+  status.textContent = saved
+    ? `Vista guardada · último escaneo ${relativeSeen(red.ultima_vez).toLowerCase()}`
+    : state.isRemoteCompany ? "Reportada por el agente" : "Conectada ahora";
+  $("#network-meta").textContent = [red.subred, gatewaySummary(red)].filter(Boolean).join(" · ");
+  const notice = $("#network-notice");
+  notice.hidden = !saved;
+  if (saved) {
+    notice.innerHTML = `<span>${state.isRemoteCompany ? "El agente reporta ahora desde" : "Ahora estás conectado a"} <strong>${esc(state.currentNetwork.nombre)}</strong>. Los equipos, las alertas y el análisis de esta página son de la red guardada.</span><button class="link-button" id="network-follow" type="button">Ver la red conectada</button>`;
+    $("#network-follow").addEventListener("click", () => selectNetwork(""));
+  }
+}
+
+async function loadNetworks() {
+  try {
+    const response = await fetch(`${API_BASE}/api/redes`, { credentials: "same-origin", headers: { Accept: "application/json", "X-GearEye-Background": "true" } });
+    if (!response.ok) return;
+    const payload = await response.json();
+    state.networks = Array.isArray(payload.redes) ? payload.redes : [];
+    $("#network-count").textContent = state.networks.length;
+    if (!$("#network-picker").hidden) renderNetworkList();
+  } catch {
+    // La lista de redes es complementaria: el panel funciona sin ella.
+  }
+}
+
+function plural(count, singular, pluralForm = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+function renderNetworkList() {
+  const viewed = viewedNetwork();
+  const currentId = state.currentNetwork?.id;
+  const option = (id, iconName, title, lines, selected) => `<button class="network-option${selected ? " selected" : ""}" type="button" data-network="${id}" aria-pressed="${selected}"><span class="network-option-icon">${icon(iconName)}</span><span class="network-option-copy"><strong>${title}</strong>${lines.map((line) => `<span>${esc(line)}</span>`).join("")}</span>${selected ? `<span class="network-check">${icon("ok")}</span>` : ""}</button>`;
+  const follow = `<li>${option("", "cambio", "Seguir la red conectada", ["Cambia sola cuando el equipo se conecta a otra red."], !viewed)}</li>`;
+  const saved = state.networks.map((red) => {
+    const title = `${esc(red.nombre)}${red.id === currentId ? ' <span class="network-badge">Conectada</span>' : ""}`;
+    const lines = [
+      [red.subred, gatewaySummary(red)].filter(Boolean).join(" · "),
+      `${plural(red.equipos, "equipo")} · ${red.activos} respondieron en el último escaneo · ${relativeSeen(red.ultima_vez)}`,
+    ];
+    return `<li data-row="${red.id}">${option(red.id, "router", title, lines, String(red.id) === viewed)}<button class="network-rename" type="button" data-rename="${red.id}" aria-label="Cambiar el nombre de ${esc(red.nombre)}">${icon("lapiz")}</button></li>`;
+  }).join("");
+  const list = $("#network-list");
+  list.innerHTML = follow + (saved || '<li class="network-empty">Aún no hay redes guardadas. Escanea para registrar la primera.</li>');
+  list.querySelectorAll("[data-network]").forEach((button) => button.addEventListener("click", () => selectNetwork(button.dataset.network)));
+  list.querySelectorAll("[data-rename]").forEach((button) => button.addEventListener("click", () => startRename(Number(button.dataset.rename))));
+}
+
+function startRename(id) {
+  const red = state.networks.find((item) => item.id === id);
+  const row = $(`#network-list [data-row="${id}"]`);
+  if (!red || !row) return;
+  row.innerHTML = `<form class="network-rename-form"><input type="text" maxlength="60" value="${esc(red.alias || "")}" placeholder="${esc(red.nombre)}" aria-label="Nombre de la red ${esc(red.subred)}" /><button class="button button-primary" type="submit">Guardar</button><button class="button button-secondary" type="button" data-cancel>Cancelar</button><span class="network-rename-hint">Déjalo vacío para usar el nombre automático.</span></form>`;
+  const form = row.querySelector("form");
+  const input = form.querySelector("input");
+  input.focus();
+  input.select();
+  form.querySelector("[data-cancel]").addEventListener("click", renderNetworkList);
+  form.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.stopPropagation(); renderNetworkList(); } });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    form.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    try {
+      const response = await fetch(`${API_BASE}/api/redes/${id}`, {
+        method: "PUT", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ nombre: input.value }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || "No se pudo cambiar el nombre de la red.");
+      if (state.network?.id === id) state.network = { ...state.network, ...result };
+      if (state.currentNetwork?.id === id) state.currentNetwork = { ...state.currentNetwork, ...result };
+      renderNetworkBar();
+      await loadNetworks();
+      renderNetworkList();
+      showToast(`Red guardada como «${result.nombre}».`);
+    } catch (error) {
+      showToast(error.message);
+      form.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+    }
+  });
+}
+
+function setNetworkPicker(open) {
+  $("#network-picker").hidden = !open;
+  $("#network-toggle").setAttribute("aria-expanded", String(open));
+  if (open) { renderNetworkList(); loadNetworks(); }
+}
+
+async function selectNetwork(id) {
+  setViewedNetwork(id);
+  setNetworkPicker(false);
+  await scanNetwork();
+}
+
+$("#network-toggle").addEventListener("click", () => setNetworkPicker($("#network-picker").hidden));
+$("#network-bar").addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("#network-picker").hidden) { setNetworkPicker(false); $("#network-toggle").focus(); }
+});
+elements.scan.addEventListener("click", () => scanNetwork());
 $("#monitor-toggle").addEventListener("click", async () => {
   monitorEnabled = !monitorEnabled;
   updateMonitorControls();
@@ -1020,6 +1260,7 @@ $("#events-export").addEventListener("click", exportEvents);
 $("#save-device-notes").addEventListener("click", saveDeviceNotes);
 $("#events-reload").addEventListener("click", loadEvents);
 $("#alerts-reload").addEventListener("click", () => loadAlerts());
+$("#ai-reload").addEventListener("click", () => loadAnalysis());
 $("#performance-reload").addEventListener("click", () => loadPerformance());
 $("#performance-period").addEventListener("change", () => loadPerformance());
 $("#performance-search").addEventListener("input", renderPerformance);
@@ -1038,10 +1279,10 @@ $("#report-button").addEventListener("click", downloadReport);
 $("#detail-refresh").addEventListener("click", () => {
   if (state.selectedIp) {
     loadDiagnostic(state.selectedIp);
-    loadHistory(state.selectedIp);
+    loadHistory(state.selectedDevice?.ips?.length ? state.selectedDevice.ips : [state.selectedIp]);
   }
 });
-$("#history-reload").addEventListener("click", () => state.selectedIp && loadHistory(state.selectedIp));
+$("#history-reload").addEventListener("click", () => state.selectedIp && loadHistory(state.selectedDevice?.ips?.length ? state.selectedDevice.ips : [state.selectedIp]));
 $("#advanced-run").addEventListener("click", runAdvancedDiagnostics);
 document.querySelectorAll(".close-dialog").forEach((button) => button.addEventListener("click", () => elements.dialog.close()));
 elements.dialog.addEventListener("click", (event) => { if (event.target === elements.dialog) elements.dialog.close(); });

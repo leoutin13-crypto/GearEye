@@ -16,23 +16,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from mac_vendor_lookup import MacLookup
 
 from Backend.Models.Dispositivo import Dispositivo
+from Backend.Services.Identificacion import clasificar, puertos_abiertos, ttl_desde_ping
 
 logger = logging.getLogger(__name__)
 
 def obtener_configuracion_red_local():
     comando = (
         "$ErrorActionPreference = 'Stop'; "
-        "$c = Get-NetIPConfiguration | Where-Object { "
+        "$candidates = @(Get-NetIPConfiguration | Where-Object { "
         "$_.NetAdapter.Status -eq 'Up' -and "
         "$_.IPv4Address -and $_.IPv4DefaultGateway "
+        "}); "
+        "$c = $candidates | Sort-Object { "
+        "$description = [string]$_.NetAdapter.Name + ' ' + [string]$_.NetAdapter.InterfaceDescription + ' ' + [string]$_.NetAdapter.PhysicalMediaType; "
+        "if ($description -match '(?i)ethernet|802\\.3|wired|cable') { 0 } "
+        "elseif ($description -match '(?i)wi-?fi|wireless|802\\.11|WLAN') { 2 } else { 1 } "
         "} | Select-Object -First 1; "
         "if (-not $c) { exit 2 }; "
         "$a = $c.IPv4Address | Select-Object -First 1; "
+        "$description = [string]$c.NetAdapter.InterfaceDescription; "
+        "$connectionType = if (($c.NetAdapter.Name + ' ' + $description + ' ' + $c.NetAdapter.PhysicalMediaType) -match '(?i)ethernet|802\\.3|wired|cable') { 'Ethernet' } elseif (($c.NetAdapter.Name + ' ' + $description + ' ' + $c.NetAdapter.PhysicalMediaType) -match '(?i)wi-?fi|wireless|802\\.11|WLAN') { 'Wi-Fi' } else { 'Red cableada/virtual' }; "
         "[pscustomobject]@{ "
         "IPAddress = $a.IPAddress; "
         "PrefixLength = $a.PrefixLength; "
         "Gateway = $c.IPv4DefaultGateway[0].NextHop; "
-        "MacAddress = $c.NetAdapter.MacAddress "
+        "MacAddress = $c.NetAdapter.MacAddress; "
+        "AdapterName = $c.NetAdapter.Name; "
+        "AdapterDescription = $description; "
+        "ConnectionType = $connectionType "
         "} | ConvertTo-Json -Compress"
     )
 
@@ -60,6 +71,9 @@ def obtener_configuracion_red_local():
         prefijo = datos.get("PrefixLength")
         mac = datos.get("MacAddress")
         puerta_enlace = datos.get("Gateway")
+        adaptador = datos.get("AdapterName")
+        descripcion_adaptador = datos.get("AdapterDescription")
+        tipo_conexion = datos.get("ConnectionType") or "Red cableada/virtual"
 
         if not ip_local or prefijo is None:
             print(f"Configuración de red incompleta: {datos}")
@@ -78,7 +92,10 @@ def obtener_configuracion_red_local():
             "ip": ip_local,
             "mac": mac or None,
             "red": red,
-            "puerta_enlace": puerta_enlace
+            "puerta_enlace": puerta_enlace,
+            "adaptador": adaptador,
+            "descripcion_adaptador": descripcion_adaptador,
+            "tipo_conexion": tipo_conexion,
         }
 
     except (
@@ -362,72 +379,6 @@ def obtener_fabricante(mac):
             logger.debug("No se pudo consultar fabricante para %s", mac, exc_info=True)
         return "Desconocido"
 
-def obtener_tipo(ip, nombre, fabricante_red):
-
-    if nombre:
-
-        nombre_mayusculas = nombre.upper()
-
-        if any(
-
-            palabra in nombre_mayusculas
-
-            for palabra in [
-
-                "COL-CO", "DESKTOP", "LAPTOP", "THINKPAD", "LATITUDE",
-
-                "ELITEBOOK", "MACBOOK", "MAC-", "IMAC", "COMPUTER",
-
-                "WORKSTATION", "NOTEBOOK", "PC-"
-
-            ]
-
-        ):
-
-            return "computador"
-
-        if any(
-
-            palabra in nombre_mayusculas
-
-            for palabra in [
-
-                "NPI", "PRINTER", "PRINT", "LASERJET", "OFFICEJET",
-
-                "DESKJET", "PIXMA", "ECOTANK", "WORKFORCE"
-
-            ]
-
-        ):
-
-            return "impresora"
-
-    if fabricante_red:
-
-        fabricante_mayusculas = fabricante_red.upper()
-
-        if any(
-
-            palabra in fabricante_mayusculas
-
-            for palabra in ["HEWLETT PACKARD", "HP INC", "CANON", "EPSON", "BROTHER"]
-
-        ):
-
-            return "impresora"
-
-        if any(
-
-            palabra in fabricante_mayusculas
-
-            for palabra in ["CISCO", "CISCO MERAKI", "JUNIPER", "UBIQUITI", "MIKROTIK"]
-
-        ):
-
-            return "dispositivo_red"
-
-    return "desconocido"
-
 def comprobar_dispositivo(
 
     ip,
@@ -476,9 +427,13 @@ def comprobar_dispositivo(
 
         ping_exitoso = resultado.returncode == 0
 
+        ttl = ttl_desde_ping(resultado.stdout) if ping_exitoso else None
+
     except (subprocess.TimeoutExpired, OSError):
 
         ping_exitoso = False
+
+        ttl = None
 
     tiempo_respuesta = round((time.perf_counter() - inicio) * 1000, 2)
 
@@ -498,7 +453,9 @@ def comprobar_dispositivo(
 
     fabricante_red = obtener_fabricante(mac)
 
-    tipo = obtener_tipo(ip, nombre, fabricante_red)
+    puertos = puertos_abiertos(ip) if ping_exitoso or mac is not None else []
+
+    tipo, sistema = clasificar(nombre, fabricante_red, mac, ttl, puertos)
 
     fabricante = (
         fabricante_red
@@ -511,6 +468,8 @@ def comprobar_dispositivo(
     if ip == ip_local:
 
         tipo = "computador"
+
+        sistema = "Windows"
 
         if datos_equipo_local is None:
 
@@ -570,7 +529,13 @@ def comprobar_dispositivo(
 
         estado=estado,
 
-        tiempo_respuesta=tiempo_respuesta
+        tiempo_respuesta=tiempo_respuesta,
+
+        sistema=sistema,
+
+        puertos=puertos,
+
+        ttl=ttl
 
     )
 
@@ -689,13 +654,17 @@ def descubrir_red_local():
 
                 if dispositivo.ip != ip_local:
 
-                    dispositivo.tipo = obtener_tipo(
-
-                        dispositivo.ip,
+                    dispositivo.tipo, dispositivo.sistema = clasificar(
 
                         dispositivo.nombre,
 
-                        dispositivo.fabricante_red
+                        dispositivo.fabricante_red,
+
+                        mac,
+
+                        dispositivo.ttl,
+
+                        dispositivo.puertos
 
                     )
 
@@ -710,6 +679,9 @@ def descubrir_red_local():
         "puerta_enlace": puerta_enlace,
         "ip_local": ip_local,
         "subred": str(red_escaneo),
+        "adaptador_red": configuracion["adaptador"],
+        "descripcion_adaptador": configuracion["descripcion_adaptador"],
+        "tipo_conexion": configuracion["tipo_conexion"],
     }
 
 

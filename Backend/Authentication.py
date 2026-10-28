@@ -153,6 +153,11 @@ class InviteRequest(BaseModel):
     role: str = Field(pattern="^(company_admin|viewer)$")
 
 
+class UserUpdateRequest(BaseModel):
+    role: str | None = Field(default=None, pattern="^(company_admin|viewer)$")
+    disabled: bool | None = None
+
+
 class AcceptInviteRequest(BaseModel):
     token: str = Field(min_length=32, max_length=120)
     password: str = Field(min_length=12, max_length=200)
@@ -198,27 +203,135 @@ def confirm_invite(token, payload, response, request):
         return {"ok": True, "username": user["username"]}
 
 
-def admin_overview(actor):
-    state = _read_state()
-    if actor.get("role") not in {"platform_admin", "company_admin"}:
+ADMIN_ROLES = {"platform_admin", "company_admin"}
+ROLE_LABELS = {"platform_admin": "Administrador general", "company_admin": "Administrador de empresa", "viewer": "Solo consulta"}
+INVITE_TTL = 48 * 60 * 60
+
+
+def _require_admin(actor):
+    if actor.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Tu cuenta no tiene permisos de administración.")
+
+
+def _check_scope(actor, company_id):
+    if actor.get("role") == "company_admin" and company_id != actor.get("company_id"):
+        raise HTTPException(status_code=403, detail="Solo puedes administrar personas de tu empresa.")
+
+
+def _invite_id(token_hash):
+    """Identificador público de una invitación: no permite reconstruir el enlace."""
+    return token_hash[:16]
+
+
+def _find_invitation(state, invite_id):
+    matches = [token_hash for token_hash in state.get("invitations", {}) if _invite_id(token_hash) == invite_id]
+    if len(matches) != 1:
+        raise HTTPException(status_code=404, detail="La invitación ya no existe: puede que la persona ya la haya aceptado.")
+    return matches[0]
+
+
+def _public_user(user, actor, company_names):
+    return {"id": user.get("username"), "kind": "user", "name": user.get("name", user.get("username", "")),
+            "email": user.get("email", ""), "company_id": user.get("company_id"),
+            "company_name": company_names.get(user.get("company_id"), ""),
+            "role": user.get("role"), "role_label": ROLE_LABELS.get(user.get("role"), "Invitado"),
+            "status": "disabled" if user.get("disabled") else "active", "disabled": bool(user.get("disabled")),
+            "is_self": user.get("username") == actor.get("username")}
+
+
+def admin_overview(actor):
+    _require_admin(actor)
+    state = _read_state()
     companies = state.get("companies", [])
     users = list(state.get("users", {}).values())
+    invitations = list(state.get("invitations", {}).items())
     if actor.get("role") == "company_admin":
         companies = [c for c in companies if c.get("id") == actor.get("company_id")]
         users = [u for u in users if u.get("company_id") == actor.get("company_id")]
+        invitations = [(h, inv) for h, inv in invitations if inv.get("company_id") == actor.get("company_id")]
+    names = {c.get("id"): c.get("name") for c in companies}
     counts = {c.get("id"): sum(u.get("company_id") == c.get("id") for u in users) for c in companies}
+    pending = {c.get("id"): sum(inv.get("company_id") == c.get("id") for _, inv in invitations) for c in companies}
+    now = time.time()
+    people = [_public_user(u, actor, names) for u in users]
+    people += [{"id": _invite_id(token_hash), "kind": "invitation", "name": inv.get("name", ""), "email": inv.get("email", ""),
+                "company_id": inv.get("company_id"), "company_name": names.get(inv.get("company_id"), inv.get("company_name", "")),
+                "role": inv.get("role"), "role_label": ROLE_LABELS.get(inv.get("role"), "Invitado"),
+                "status": "expired" if inv.get("expires_at", 0) < now else "invited", "disabled": False,
+                "is_self": False, "expires_at": inv.get("expires_at")} for token_hash, inv in invitations]
     return {
         "companies": [{"id": c.get("id"), "name": c.get("name"), "status": c.get("status", "active"),
                        "created_at": c.get("created_at"), "last_agent_report": c.get("last_agent_report"),
-                       "user_count": counts.get(c.get("id"), 0)} for c in companies],
-        "users": [{"name": u.get("name", u.get("username", "")), "email": u.get("email", ""),
-                   "company_id": u.get("company_id"),
-                   "company_name": next((c["name"] for c in companies if c.get("id") == u.get("company_id")), ""),
-                   "role": u.get("role"), "role_label": {"platform_admin": "Administrador general", "company_admin": "Administrador de empresa", "viewer": "Consulta"}.get(u.get("role"), "Invitado"),
-                   "disabled": bool(u.get("disabled"))} for u in users],
+                       "user_count": counts.get(c.get("id"), 0), "pending_invitations": pending.get(c.get("id"), 0)} for c in companies],
+        "users": people,
     }
 
+
+def update_user(actor, username, payload):
+    _require_admin(actor)
+    if payload.role is None and payload.disabled is None:
+        raise HTTPException(status_code=422, detail="Indica el rol o el estado que quieres cambiar.")
+    with _lock:
+        state = _read_state()
+        user = state.get("users", {}).get(username)
+        if not user:
+            raise HTTPException(status_code=404, detail="No se encontró ese usuario.")
+        _check_scope(actor, user.get("company_id"))
+        if username == actor.get("username"):
+            raise HTTPException(status_code=409, detail="No puedes cambiar tu propio rol ni desactivar tu cuenta.")
+        if user.get("role") == "platform_admin":
+            raise HTTPException(status_code=403, detail="La cuenta de administrador general no se modifica desde aquí.")
+        if payload.role is not None:
+            user["role"] = payload.role
+        if payload.disabled is not None:
+            # Las sesiones abiertas se cierran solas: _valid_session rechaza cuentas desactivadas.
+            user["disabled"] = payload.disabled
+        _write_state(state)
+        names = {c.get("id"): c.get("name") for c in state.get("companies", [])}
+        return _public_user(user, actor, names)
+
+
+def revoke_invitation(actor, invite_id):
+    _require_admin(actor)
+    with _lock:
+        state = _read_state()
+        token_hash = _find_invitation(state, invite_id)
+        invitation = state["invitations"][token_hash]
+        _check_scope(actor, invitation.get("company_id"))
+        state["invitations"].pop(token_hash)
+        state.get("pending_users", {}).pop(token_hash, None)
+        _write_state(state)
+    return {"ok": True, "email": invitation.get("email")}
+
+
+def resend_invitation(actor, invite_id, request):
+    _rate_limit(request)
+    _require_admin(actor)
+    host = _public_url()
+    smtp_from = _smtp_sender("Falta configurar el correo SMTP de GearEye para enviar invitaciones.")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with _lock:
+        state = _read_state()
+        old_hash = _find_invitation(state, invite_id)
+        previous = state["invitations"][old_hash]
+        _check_scope(actor, previous.get("company_id"))
+        # El enlace anterior deja de servir: solo vale el que se envía ahora.
+        invitation = {**previous, "expires_at": int(time.time()) + INVITE_TTL}
+        state["invitations"].pop(old_hash)
+        state.get("pending_users", {}).pop(old_hash, None)
+        state["invitations"][token_hash] = invitation
+        _write_state(state)
+    try:
+        _send_mail(_invitation_message(invitation, f"{host}/app/?invite={token}", smtp_from))
+    except (OSError, smtplib.SMTPException, ValueError) as error:
+        with _lock:
+            state = _read_state()
+            state.get("invitations", {}).pop(token_hash, None)
+            state.setdefault("invitations", {})[old_hash] = previous
+            _write_state(state)
+        raise HTTPException(status_code=502, detail="No se pudo reenviar la invitación. Revisa la configuración SMTP.") from error
+    return {"ok": True, "email": invitation["email"], "id": _invite_id(token_hash)}
 
 def create_company(actor, payload):
     if actor.get("role") != "platform_admin":
@@ -228,20 +341,8 @@ def create_company(actor, payload):
     admin_email = payload.admin_email.strip().lower()
     if len(name) < 2 or len(admin_name) < 2 or admin_email.count("@") != 1 or "." not in admin_email.rsplit("@", 1)[-1]:
         raise HTTPException(status_code=422, detail="Escribe un nombre de empresa, nombre y correo validos para el administrador.")
-    smtp_host = os.environ.get("GEAREYE_SMTP_HOST", "").strip()
-    smtp_from = os.environ.get("GEAREYE_SMTP_FROM", "").strip()
-    if not smtp_host or not smtp_from:
-        raise HTTPException(status_code=503, detail="Configura el correo SMTP de GearEye antes de crear empresas.")
-    host = os.environ.get("GEAREYE_PUBLIC_URL", "").strip().rstrip("/")
-    parsed_host = urlsplit(host)
-    try:
-        is_ip_address = bool(parsed_host.hostname and ipaddress.ip_address(parsed_host.hostname))
-    except ValueError:
-        is_ip_address = False
-    if (parsed_host.scheme != "https" or not parsed_host.hostname or is_ip_address
-            or parsed_host.hostname == "localhost" or parsed_host.path not in {"", "/"}
-            or parsed_host.query or parsed_host.fragment or parsed_host.username or parsed_host.password):
-        raise HTTPException(status_code=503, detail="Configura GEAREYE_PUBLIC_URL con un dominio HTTPS antes de enviar invitaciones.")
+    smtp_from = _smtp_sender("Configura el correo SMTP de GearEye antes de crear empresas.")
+    host = _public_url()
 
     company_id = secrets.token_urlsafe(12)
     agent_token = secrets.token_urlsafe(40)
@@ -249,7 +350,7 @@ def create_company(actor, payload):
     invite_hash = hashlib.sha256(invite_token.encode()).hexdigest()
     company = {"id": company_id, "name": name, "status": "waiting_agent", "created_at": int(time.time()), "agent_token_hash": hashlib.sha256(agent_token.encode()).hexdigest()}
     invitation = {"name": admin_name, "email": admin_email, "company_id": company_id,
-                  "company_name": name, "role": "company_admin", "expires_at": int(time.time()) + 48 * 60 * 60}
+                  "company_name": name, "role": "company_admin", "expires_at": int(time.time()) + INVITE_TTL}
     with _lock:
         state = _read_state()
         companies = state.setdefault("companies", [])
@@ -258,7 +359,7 @@ def create_company(actor, payload):
         users = state.setdefault("users", {})
         pending = state.get("invitations", {}).values()
         if any(key.casefold() == admin_email for key in users) or any(user.get("email", "").casefold() == admin_email for user in users.values()) or any(item.get("email", "").casefold() == admin_email for item in pending):
-            raise HTTPException(status_code=409, detail="Ese correo ya tiene una cuenta o invitaciÃ³n pendiente.")
+            raise HTTPException(status_code=409, detail="Ese correo ya tiene una cuenta o invitación pendiente.")
         companies.append(company)
         state.setdefault("invitations", {})[invite_hash] = invitation
         _write_state(state)
@@ -280,23 +381,7 @@ def create_company(actor, payload):
         "El token del agente es privado. No lo compartas ni lo publiques.\n"
     )
     try:
-        port = int(os.environ.get("GEAREYE_SMTP_PORT", "587"))
-        username = os.environ.get("GEAREYE_SMTP_USER", "")
-        password = os.environ.get("GEAREYE_SMTP_PASSWORD", "")
-        if port == 465:
-            with smtplib.SMTP_SSL(smtp_host, port, timeout=15, context=ssl.create_default_context()) as server:
-                if username:
-                    server.login(username, password)
-                server.send_message(message)
-        else:
-            with smtplib.SMTP(smtp_host, port, timeout=15) as server:
-                server.ehlo()
-                if os.environ.get("GEAREYE_SMTP_STARTTLS", "true").lower() == "true":
-                    server.starttls(context=ssl.create_default_context())
-                    server.ehlo()
-                if username:
-                    server.login(username, password)
-                server.send_message(message)
+        _send_mail(message)
     except (OSError, smtplib.SMTPException, ValueError) as error:
         with _lock:
             state = _read_state()
@@ -306,7 +391,7 @@ def create_company(actor, payload):
         raise HTTPException(status_code=502, detail="No se pudo enviar el correo de bienvenida. Revisa la configuracion SMTP.") from error
     return {"id": company_id, "name": name, "status": company["status"], "email": admin_email}
 
-def company_for_agent_token(token):
+def company_for_agent_token(token, mark_report=True):
     if not token:
         return None
     supplied_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -316,22 +401,16 @@ def company_for_agent_token(token):
         for company in state.get("companies", []):
             stored_hash = company.get("agent_token_hash", "")
             if stored_hash and hmac.compare_digest(supplied_hash, stored_hash):
-                company["last_agent_report"] = int(time.time())
+                if mark_report:
+                    company["last_agent_report"] = int(time.time())
                 company["status"] = "active"
                 _write_state(state)
                 return {"id": company["id"], "name": company["name"]}
     return None
 
 
-def invite_user(actor, payload, request):
-    _rate_limit(request)
-    if actor.get("role") not in {"platform_admin", "company_admin"}:
-        raise HTTPException(status_code=403, detail="Tu cuenta no puede invitar usuarios.")
-    email = payload.email.strip().lower()
-    if email.count("@") != 1 or "." not in email.rsplit("@", 1)[-1]:
-        raise HTTPException(status_code=422, detail="Escribe un correo válido.")
-    if actor.get("role") == "company_admin" and payload.company_id != actor.get("company_id"):
-        raise HTTPException(status_code=403, detail="Solo puedes invitar usuarios a tu empresa.")
+def _public_url():
+    """Dominio HTTPS público al que apuntan los enlaces de invitación."""
     host = os.environ.get("GEAREYE_PUBLIC_URL", "").strip().rstrip("/")
     parsed_host = urlsplit(host)
     try:
@@ -342,62 +421,88 @@ def invite_user(actor, payload, request):
             or parsed_host.hostname == "localhost" or parsed_host.path not in {"", "/"}
             or parsed_host.query or parsed_host.fragment or parsed_host.username or parsed_host.password):
         raise HTTPException(status_code=503, detail="Configura GEAREYE_PUBLIC_URL con un dominio HTTPS antes de enviar invitaciones.")
+    return host
+
+
+def _smtp_sender(detail):
+    smtp_from = os.environ.get("GEAREYE_SMTP_FROM", "").strip()
+    if not os.environ.get("GEAREYE_SMTP_HOST", "").strip() or not smtp_from:
+        raise HTTPException(status_code=503, detail=detail)
+    return smtp_from
+
+
+def _send_mail(message):
+    smtp_host = os.environ.get("GEAREYE_SMTP_HOST", "").strip()
+    port = int(os.environ.get("GEAREYE_SMTP_PORT", "587"))
+    username = os.environ.get("GEAREYE_SMTP_USER", "")
+    password = os.environ.get("GEAREYE_SMTP_PASSWORD", "")
+    if port == 465:
+        with smtplib.SMTP_SSL(smtp_host, port, timeout=15, context=ssl.create_default_context()) as server:
+            if username:
+                server.login(username, password)
+            server.send_message(message)
+        return
+    with smtplib.SMTP(smtp_host, port, timeout=15) as server:
+        server.ehlo()
+        if os.environ.get("GEAREYE_SMTP_STARTTLS", "true").lower() == "true":
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+        if username:
+            server.login(username, password)
+        server.send_message(message)
+
+
+def _invitation_message(invitation, link, smtp_from):
+    purpose = "administrar" if invitation.get("role") == "company_admin" else "consultar"
+    message = EmailMessage()
+    message["Subject"] = f"Invitación a GearEye · {invitation['company_name']}"
+    message["From"] = smtp_from
+    message["To"] = invitation["email"]
+    message.set_content(f"Hola {invitation['name']},\n\nTe invitaron a GearEye para {purpose} la red de {invitation['company_name']}.\nAcepta la invitación en las próximas 48 horas: {link}\n\nEl enlace es personal y de un solo uso.")
+    return message
+
+
+def _email_taken(state, email):
+    users = state.get("users", {})
+    return (any(key.casefold() == email for key in users)
+            or any(user.get("email", "").casefold() == email for user in users.values())
+            or any(item.get("email", "").casefold() == email for item in state.get("invitations", {}).values()))
+
+
+def invite_user(actor, payload, request):
+    _rate_limit(request)
+    if actor.get("role") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Tu cuenta no puede invitar usuarios.")
+    email = payload.email.strip().lower()
+    if email.count("@") != 1 or "." not in email.rsplit("@", 1)[-1]:
+        raise HTTPException(status_code=422, detail="Escribe un correo válido.")
+    if actor.get("role") == "company_admin" and payload.company_id != actor.get("company_id"):
+        raise HTTPException(status_code=403, detail="Solo puedes invitar usuarios a tu empresa.")
+    host = _public_url()
+    smtp_from = _smtp_sender("Falta configurar el correo SMTP de GearEye para enviar invitaciones.")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
     with _lock:
         state = _read_state()
         company = next((c for c in state.get("companies", []) if c.get("id") == payload.company_id), None)
         if not company:
             raise HTTPException(status_code=404, detail="No se encontró la empresa seleccionada.")
-        users = state.setdefault("users", {})
-        pending = state.get("invitations", {}).values()
-        if any(key.casefold() == email for key in users) or any(u.get("email", "").casefold() == email for u in users.values()) or any(inv.get("email", "").casefold() == email for inv in pending):
-            raise HTTPException(status_code=409, detail="Ese correo ya tiene una cuenta.")
-        token = secrets.token_urlsafe(32)
-        state.setdefault("invitations", {})[hashlib.sha256(token.encode()).hexdigest()] = {
-            "name": payload.name.strip(), "email": email, "company_id": company["id"],
-            "company_name": company["name"], "role": payload.role,
-            "expires_at": int(time.time()) + 48 * 60 * 60,
-        }
+        if _email_taken(state, email):
+            raise HTTPException(status_code=409, detail="Ese correo ya tiene una cuenta o una invitación pendiente.")
+        invitation = {"name": payload.name.strip(), "email": email, "company_id": company["id"],
+                      "company_name": company["name"], "role": payload.role,
+                      "expires_at": int(time.time()) + INVITE_TTL}
+        state.setdefault("invitations", {})[token_hash] = invitation
         _write_state(state)
-    link = f"{host}/app/?invite={token}"
-    smtp_host = os.environ.get("GEAREYE_SMTP_HOST", "").strip()
-    smtp_from = os.environ.get("GEAREYE_SMTP_FROM", "").strip()
-    if not smtp_host or not smtp_from:
-        with _lock:
-            state = _read_state()
-            state.get("invitations", {}).pop(hashlib.sha256(token.encode()).hexdigest(), None)
-            _write_state(state)
-        raise HTTPException(status_code=503, detail="Falta configurar el correo SMTP de GearEye para enviar invitaciones.")
-    message = EmailMessage()
-    message["Subject"] = f"Invitación a GearEye · {company['name']}"
-    message["From"] = smtp_from
-    message["To"] = email
-    message.set_content(f"Hola {payload.name.strip()},\n\nTe invitaron a GearEye para consultar la red de {company['name']}.\nAcepta la invitación en las próximas 48 horas: {link}\n\nEl enlace es personal y de un solo uso.")
     try:
-        port = int(os.environ.get("GEAREYE_SMTP_PORT", "587"))
-        username = os.environ.get("GEAREYE_SMTP_USER", "")
-        password = os.environ.get("GEAREYE_SMTP_PASSWORD", "")
-        if port == 465:
-            with smtplib.SMTP_SSL(smtp_host, port, timeout=15, context=ssl.create_default_context()) as server:
-                if username:
-                    server.login(username, password)
-                server.send_message(message)
-        else:
-            with smtplib.SMTP(smtp_host, port, timeout=15) as server:
-                server.ehlo()
-                if os.environ.get("GEAREYE_SMTP_STARTTLS", "true").lower() == "true":
-                    server.starttls(context=ssl.create_default_context())
-                    server.ehlo()
-                if username:
-                    server.login(username, password)
-                server.send_message(message)
+        _send_mail(_invitation_message(invitation, f"{host}/app/?invite={token}", smtp_from))
     except (OSError, smtplib.SMTPException, ValueError) as error:
         with _lock:
             state = _read_state()
-            state.get("invitations", {}).pop(hashlib.sha256(token.encode()).hexdigest(), None)
+            state.get("invitations", {}).pop(token_hash, None)
             _write_state(state)
         raise HTTPException(status_code=502, detail="No se pudo enviar la invitación. Revisa la configuración SMTP.") from error
     return {"ok": True, "email": email}
-
 
 def status(request: Request):
     with _lock:
